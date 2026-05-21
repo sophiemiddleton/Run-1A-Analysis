@@ -1,0 +1,16 @@
+Cut,Group,Events Passing,Absolute [%],Relative [%],Description
+No cuts,N/A,8780533,100.0,100.0,No selection applied
+is_reco_electron,,8286328,94.37158313737902,94.37158313737902,Tracks are assumed to be electrons (trk)
+has_downstream,,8285778,94.3653192807316,99.9933625605938,Downstream tracks (p_z > 0 through tracker)
+has_trk_front_seg,,8285722,94.36468150623658,99.99932414312815,Track has >=1 segment intersecting TT_Front
+good_trkpid,,7016936,79.91469310576021,84.68707977409814,Track PID > 0.638
+good_trkqual,,5828931,66.38470580316708,83.06946222681809,Track quality  > 0.2
+within_t0err,,5828927,66.384660247846,99.99993137678247,t0err < 0.9
+has_hits,,5535437,63.04215245247641,94.96493951631236,Minimum of 20 active hits in the tracker
+has_st,,5289668,60.243131026328356,95.56007953843572,has Nst > 0
+no_opa,,5289318,60.23914493573454,99.9933833276493,has N_opa == 0
+no_crv_quality,,5289318,60.23914493573454,100.0,"No high-quality CRV coincidence (PEs>25, nHits>=15, span<175ns)"
+no_crv_timewindow,,5289317,60.23913354690427,99.9999810939709,No CRV coincidence with start>429 and end<1700 within dt threshold
+no_crv_veto,,5289317,60.23913354690427,100.0,No crv-trk veto: |dt| >= 150 ns
+pz_over_pt,,5010344,57.06195740053593,94.72572734816235,Track-level cut: 0.5 < pz/pt < 1.0 (pt = transverse mag)
+good_trigger,,3984175,45.37509283320272,79.51899111118918,trigger passed

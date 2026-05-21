@@ -1,0 +1,2 @@
+/exp/mu2e/app/home/mu2epro/CE_study/nts.owner.CeEnd.version.sequencer.root
+/exp/mu2e/app/home/mu2epro/CE_study/nts.owner.CeLL.version.sequencer.root

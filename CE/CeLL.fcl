@@ -1,0 +1,15 @@
+#include "Production/JobConfig/primary/CeMLeadingLog.fcl"
+services.GeometryService.bFieldFile: "Offline/Mu2eG4/geom/bfgeom_no_tsu_ps_v01.txt"
+services.GeometryService.inputFile: "Offline/Mu2eG4/geom/geom_run1_a.txt"
+physics.filters.TargetStopResampler.mu2e.MaxEventsToSkip: 1435092
+
+outputs.Output.fileName : "dts.tester.CeMLL.Test.1.art"
+services.TFileService.fileName: "nts.owner.CeLL.version.sequencer.root"
+source.firstRun: 1431
+
+
+
+physics.filters.TargetStopResampler.fileNames : [
+"/pnfs/mu2e/persistent/datasets/phy-sim/sim/mu2e/MuminusStopsCat/MDC2025ac/art/95/88/sim.mu2e.MuminusStopsCat.MDC2025ac.001430_00000000.art"]
+
+physics.filters.TargetStopResampler.mu2e.MaxEventsToSkip: 0
