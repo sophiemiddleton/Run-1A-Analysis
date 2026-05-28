@@ -1,24 +1,37 @@
-from platform import processor
+print("DEBUG: Importing modules...", flush=True)
 
 import gc
 import sys
 from datetime import datetime
 import numpy as np
+
+
+# Set non-interactive backend BEFORE importing pyplot
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import uproot
 import awkward as ak
 import argparse
 import csv
+import pickle as pkl
+import zfit
 from sklearn.model_selection import train_test_split
+
 import pandas as pd
 import xgboost as xgb
-
 # this ana
 from compare import Compare
 from cosmics import Cosmics
+from rpc import RPC
 from analyze import Analyze
+from rle import generate_rle_calibration
+from spectrum import TheorySpectrum
 from pyutils.pycut import CutManager
 from pyutils.pylogger import Logger
+import optimize_cuts
+from helper import make_HistogramPDF
+
 
 #from fits import Fits
 from pyutils.pyprocess import Processor, Skeleton
@@ -584,6 +597,8 @@ def fit_dataset(files, cuts, locations, columns, signs, proctype):
       results = ana_processor.execute()
       combine_result = results["combined_data"]
 
+      
+
       # run cat
       mc_count_array, _ = count_particle_types(combine_result, logger)
       mc_count.append(mc_count_array)
@@ -612,6 +627,223 @@ def fit_dataset(files, cuts, locations, columns, signs, proctype):
     if proctype == "cosmics":
         cosmics = Cosmics()
         cosmics.fit_momentum(recomom)
+    if proctype == "rpc":
+        rpc = RPC()
+        rpc.fit_momentum(recomom, columns)
+    # Generate RLE calibration parameters for ensemble
+    if proctype == "rle":
+        rle_results = generate_rle_calibration(combine_result, "RLE/common", run_fits=True)
+
+def plot_theory_with_rle(files, cuts, locations, signs, jobs=1, rle_calib_dir="RLE/common", 
+                        mom_range=(90, 120), binwidth=0.1, output_file=None):
+    """
+    Plot reconstructed momentum data overlaid with theory convolved with RLE.
+    
+    Creates a theory spectrum from CeLL, loads resolution and loss distributions from
+    RLE calibration, convolves them, and overlays on reco data histogram.
+    
+    Args:
+        files: List of file list paths (.txt files)
+        cuts: List of cut switches for each file
+        locations: List of data locations (e.g., 'disk')
+        signs: List of particle signs (e.g., 'minus', 'plus')
+        jobs: Number of parallel jobs (default: 1)
+        rle_calib_dir (str): Path to RLE calibration output directory
+        mom_range (tuple): (min, max) momentum range for plotting
+        binwidth (float): Bin width for theory spectrum
+        output_file (str): Optional path to save plot
+        
+    Returns:
+        fig, ax: Matplotlib figure and axes objects
+    """
+    logger = Logger(print_prefix="[plot_theory_with_rle]", verbosity=1)
+    
+    try:
+        # Extract reconstructed momentum from files using standard pipeline
+        recomom = []
+        for i, fil in enumerate(files):
+            ana_processor = AnaProcessor(fil, jobs, signs[i], cuts[i], locations[i], "ensemble")
+            results = ana_processor.execute()
+            combine_result = results["combined_data"]
+            
+            selector = Select()
+            
+            # select only track front to fit to
+            trk_front = selector.select_surface(combine_result['trkfit'], surface_name="TT_Front")
+            
+            # did the track intersect the ST?
+            has_st = selector.has_ST(combine_result['trkfit'])
+            
+            # combined mask
+            trkfit_ent = ak.mask(combine_result['trkfit']["trksegs"], trk_front)
+            
+            # make vector mag branch
+            vector = Vector()
+            mom_mag = vector.get_mag(trkfit_ent, 'mom')
+            recomom.append(mom_mag)
+        
+        # Flatten reco data if list of arrays
+        if isinstance(recomom, list):
+            reco_flat = ak.flatten(ak.concatenate(recomom), axis=None)
+        else:
+            reco_flat = ak.flatten(recomom, axis=None)
+        reco_np = np.array(reco_flat)
+        logger.log(f"Loaded {len(reco_np)} reco events", "info")
+        
+        # Create theory spectrum
+        logger.log("Creating theory spectrum...", "info")
+        theory = TheorySpectrum(mom_range=mom_range, binwidth=binwidth, verbosity=1)
+        theory_pdf = theory.get_pdf()
+        
+        # Create observable space for momentum (theory will be on this)
+        obs_mom = zfit.Space('mom', limits=mom_range)
+        
+        # Load RLE calibration data
+        logger.log("Loading RLE calibration...", "info")
+        
+        print(f"\n{'='*70}", flush=True)
+        print(f"[plot_theory_with_rle] RLE CALIBRATION PIPELINE SUMMARY", flush=True)
+        print(f"{'='*70}", flush=True)
+        print(f"[plot_theory_with_rle] Theory: CeLL Leading Log (E_MAX={104.969:.3f} MeV)", flush=True)
+        print(f"[plot_theory_with_rle] Momentum range for plotting: {mom_range}", flush=True)
+        print(f"[plot_theory_with_rle] Loading calibration from: {rle_calib_dir}", flush=True)
+        print(f"{'='*70}\n", flush=True)
+        
+        # Try to load skimmed data to get res and loss distributions
+        skimmed_path = f"{rle_calib_dir}/skimmed_flat_mom_MDC2025an.pkl"
+        try:
+            with open(skimmed_path, 'rb') as f:
+                skimmed_data = pkl.load(f)
+            logger.log(f"Loaded skimmed data from {skimmed_path}", "debug")
+            
+            # Extract resolution and loss from entrance plane
+            # IMPORTANT: These are NOT Gaussian! Resolution is GCB, Loss is truncated Landau
+            res_data = skimmed_data['entrance']['reco'] - skimmed_data['entrance']['mc']
+            loss_data = skimmed_data['entrance']['mc'] - skimmed_data['entrance']['gen']
+            
+            logger.log(f"Resolution distribution: {len(res_data)} events, mean={np.mean(res_data):.4f}, std={np.std(res_data):.4f}", "debug")
+            logger.log(f"Loss distribution: {len(loss_data)} events, mean={np.mean(loss_data):.4f}, std={np.std(loss_data):.4f}", "debug")
+            
+            # Create histogram PDFs from actual distributions to preserve non-Gaussian shapes
+            # CRITICAL: Create histograms on the ACTUAL observable bounds we'll use for convolution!
+            logger.log("Creating histogram kernel PDFs from actual res/loss distributions...", "info")
+            
+            # Resolution kernel: trim to tighter percentile range to exclude tail
+            # Use 10th-90th percentile instead of 1st-99th to focus on core distribution
+            res_trimmed = res_data[(res_data > np.percentile(res_data, 10)) & 
+                                  (res_data < np.percentile(res_data, 90))]
+            
+            # Use ±1.5σ bounds, symmetric around mean
+            res_mean = np.mean(res_trimmed)
+            res_std = np.std(res_trimmed)
+            res_min_physical = max(res_mean - 1.5*res_std, -5.0)   # Cap at -5 MeV
+            res_max_physical = min(res_mean + 1.5*res_std, 5.0)    # Cap at +5 MeV
+            res_trimmed = res_trimmed[(res_trimmed >= res_min_physical) & 
+                                      (res_trimmed <= res_max_physical)]
+            
+            res_nbins = 100
+            res_counts, res_edges = np.histogram(res_trimmed, bins=res_nbins, 
+                                                  range=(res_min_physical, res_max_physical))
+            res_counts = res_counts / np.sum(res_counts)  # Normalize
+            
+            # Create histogram PDF for resolution on ACTUAL kernel observable space [-5, 5]
+            from helper import make_HistogramPDF
+            obs_res_kernel = zfit.Space('x', limits=(res_min_physical, res_max_physical))
+            ResHistPDF = make_HistogramPDF(res_counts, res_edges)
+            res_pdf = ResHistPDF(obs=obs_res_kernel)  # On [-5, 5] kernel space!
+            
+            logger.log(f"Resolution kernel: histogram from {len(res_trimmed)} events, range=[{res_min_physical:.4f}, {res_max_physical:.4f}]", "info")
+            
+            # ===== PRINT RESOLUTION PARAMETERS =====
+            print(f"\n[plot_theory_with_rle] ===== RESOLUTION PARAMETERS =====", flush=True)
+            print(f"[plot_theory_with_rle] Bins: {res_nbins}", flush=True)
+            print(f"[plot_theory_with_rle] Range: [{res_min_physical:.4f}, {res_max_physical:.4f}] MeV", flush=True)
+            print(f"[plot_theory_with_rle] Mean (trimmed): {res_mean:.4f} MeV", flush=True)
+            print(f"[plot_theory_with_rle] Std (trimmed): {res_std:.4f} MeV", flush=True)
+            print(f"[plot_theory_with_rle] Events used: {len(res_trimmed)} (from {len(res_data)} total)", flush=True)
+            print(f"[plot_theory_with_rle] Percentile range: 10-90th", flush=True)
+            print(f"[plot_theory_with_rle] ======================================\n", flush=True)
+            
+            # Loss kernel: trim to tighter percentile range to exclude tail
+            # Use 10th-90th percentile instead of 1st-99th to focus on core distribution
+            loss_trimmed = loss_data[(loss_data > np.percentile(loss_data, 10)) & 
+                                     (loss_data < np.percentile(loss_data, 90))]
+            
+            # Calculate loss mean and use tighter bounds around it (1.5σ)
+            loss_mean = np.mean(loss_trimmed)
+            loss_std = np.std(loss_trimmed)
+            # Use ±1.5σ bounds for tighter kernel, symmetric around actual mean
+            loss_min_physical = max(loss_mean - 1.5*loss_std, -15.0)   # Cap at -15 MeV
+            loss_max_physical = min(loss_mean + 1.5*loss_std, 1.0)     # Cap at +1 MeV
+            loss_trimmed = loss_trimmed[(loss_trimmed >= loss_min_physical) & 
+                                        (loss_trimmed <= loss_max_physical)]
+            
+            loss_nbins = 100
+            loss_counts, loss_edges = np.histogram(loss_trimmed, bins=loss_nbins,
+                                                    range=(loss_min_physical, loss_max_physical))
+            loss_counts = loss_counts / np.sum(loss_counts)  # Normalize
+            
+            # Create histogram PDF for loss on bounds centered at actual mean
+            obs_loss_kernel = zfit.Space('x', limits=(loss_min_physical, loss_max_physical))
+            LossHistPDF = make_HistogramPDF(loss_counts, loss_edges)
+            loss_pdf = LossHistPDF(obs=obs_loss_kernel)  # Centered on actual distribution!
+            
+            logger.log(f"Loss kernel: histogram from {len(loss_trimmed)} events, range=[{loss_min_physical:.4f}, {loss_max_physical:.4f}]", "info")
+            
+            # ===== PRINT LOSS PARAMETERS =====
+            print(f"\n[plot_theory_with_rle] ===== LOSS PARAMETERS =====", flush=True)
+            print(f"[plot_theory_with_rle] Bins: {loss_nbins}", flush=True)
+            print(f"[plot_theory_with_rle] Range: [{loss_min_physical:.4f}, {loss_max_physical:.4f}] MeV", flush=True)
+            print(f"[plot_theory_with_rle] Mean (trimmed): {loss_mean:.4f} MeV", flush=True)
+            print(f"[plot_theory_with_rle] Std (trimmed): {loss_std:.4f} MeV", flush=True)
+            print(f"[plot_theory_with_rle] Events used: {len(loss_trimmed)} (from {len(loss_data)} total)", flush=True)
+            print(f"[plot_theory_with_rle] Percentile range: 10-90th", flush=True)
+            print(f"[plot_theory_with_rle] =====================================\n", flush=True)
+            
+        except FileNotFoundError:
+            logger.log(f"Warning: Could not find {skimmed_path}", "warn")
+            logger.log("Using default Gaussian PDFs as fallback", "warn")
+            
+            # Fallback: Use simple Gaussians
+            res_pdf = zfit.pdf.Gauss(
+                mu=zfit.Parameter('res_mu', 0.0, -0.5, 0.5),
+                sigma=zfit.Parameter('res_sigma', 0.3, 0.01, 1.0),
+                obs=obs_mom
+            )
+            loss_pdf = zfit.pdf.Gauss(
+                mu=zfit.Parameter('loss_mu', -0.5, -2.0, 0.0),
+                sigma=zfit.Parameter('loss_sigma', 0.5, 0.01, 2.0),
+                obs=obs_mom
+            )
+        
+        # Create comparison and plot
+        comparison = Compare()
+        title = "Reco Momentum with Theory ⊗ RLE Convolution"
+        label = "CeLL (Leading Log) ⊗ RLE"
+        
+        if output_file is None:
+            output_file = f"{rle_calib_dir}/theory_convolved_reco.png"
+        
+        fig, ax = comparison.convolve_with_rle(
+            reco_data=reco_np,
+            theory_pdf=theory_pdf,
+            res_pdf=res_pdf,
+            loss_pdf=loss_pdf,
+            mom_range=mom_range,
+            nbins=100,
+            label=label,
+            plot_title=title,
+            output_file=output_file
+        )
+        
+        logger.log(f"Theory convolution plot saved to {output_file}", "success")
+        return fig, ax
+        
+    except Exception as e:
+        logger.log(f"Error in theory convolution: {e}", "error")
+        import traceback
+        traceback.print_exc()
+        return None, None
 
 def WriteFittedData(data, min_v, max_v):
     """ Write data used in fit to csv (i,mom,time) Note: should be in format useful to BAT"""
@@ -672,11 +904,350 @@ def print_passing_events(combine_result, cut_mask, output_file="passing_events.t
     return runs_np, subruns_np, events_np
 
 
+def optimize_cut_variable(combine_result, variable_data, signal_code=168, background_codes=None, 
+                          direction='greater', n_steps=200, metric='youden', 
+                          variable_name='variable', output_prefix=None, save_csv=False, make_plots=False):
+    """
+    Optimize a cut on a variable using signal and background data.
+    
+    Shows background and signal efficiencies and reports optimal cuts.
+    
+    Args:
+        combine_result: Combined analysis result containing mc_count data
+        variable_data: The variable values to optimize on (awkward or numpy array)
+        signal_code: MC code identifying signal (default 168 for CE)
+        background_codes: List of background MC codes; if None, all non-signal codes used
+        direction: 'greater' to keep values >= threshold, 'less' for <=
+        n_steps: Number of threshold steps to scan
+        metric: Optimization metric ('youden' or 's_over_sqrtb')
+        variable_name: Name of variable for output formatting
+        output_prefix: Prefix for output files (CSV and plots)
+        save_csv: If True, save scan results to CSV file
+        make_plots: If True, create plots of scan results
+        
+    Returns:
+        Dictionary with:
+            - 'rows': All scan results
+            - 'best': Best threshold result
+            - 'signal_eff': Signal efficiency at optimum
+            - 'bkg_eff': Background efficiency at optimum
+            - 'optimal_threshold': Optimal threshold value
+    """
+    logger = Logger(print_prefix=f"[optimize_cut_variable: {variable_name}]", verbosity=1)
+    
+    # Get mc_count array
+    mc_count_array, mc_counts_dict = count_particle_types(combine_result, logger=logger)
+    
+    logger.log(f"Optimizing cut on {variable_name}...", "info")
+    
+    # Run optimization using optimize_cuts
+    rows, best = optimize_cuts.optimize_from_event_arrays(
+        variable_data, 
+        mc_count_array, 
+        signal_code=signal_code, 
+        background_codes=background_codes,
+        direction=direction, 
+        n_steps=n_steps, 
+        metric=metric
+    )
+    
+    if best is None:
+        logger.log(f"No valid threshold found for {variable_name}", "warning")
+        return None
+    
+    # Extract efficiency information
+    signal_eff = best['tpr']
+    bkg_eff = 1.0 - best['bkg_rej']  # Background efficiency = 1 - background rejection
+    optimal_threshold = best['threshold']
+    
+    # Print results
+    logger.log(f"═" * 60, "info")
+    logger.log(f"Optimization Results for: {variable_name}", "info")
+    logger.log(f"═" * 60, "info")
+    logger.log(f"Optimal Threshold:        {optimal_threshold:.6g}", "info")
+    logger.log(f"Signal Efficiency (TPR):  {signal_eff:.4f} ({best['nsig_pass']} / {best['nsig_pass'] + (best['nsig_pass'] / signal_eff - best['nsig_pass']) if signal_eff > 0 else 'N/A'})", "info")
+    logger.log(f"Background Efficiency:    {bkg_eff:.4f}", "info")
+    logger.log(f"Background Rejection:     {best['bkg_rej']:.4f}", "info")
+    logger.log(f"Optimization Metric:      {best['metric']:.6g}", "info")
+    logger.log(f"Signal Pass Count:        {best['nsig_pass']}", "info")
+    logger.log(f"Background Pass Count:    {best['nbkg_pass']}", "info")
+    logger.log(f"═" * 60, "info")
+    
+    # Save CSV if requested
+    if save_csv and output_prefix:
+        csv_path = f"{output_prefix}_{variable_name}_scan.csv"
+        optimize_cuts.save_csv(rows, csv_path)
+        logger.log(f"Saved scan results to: {csv_path}", "info")
+    
+    # Create plots if requested
+    if make_plots and output_prefix:
+        # Plot efficiency vs background rejection
+        plot1_path = f"{output_prefix}_{variable_name}_eff_vs_bkg.png"
+        optimize_cuts.plot_scan(rows, plot1_path, show=False)
+        logger.log(f"Saved efficiency plot to: {plot1_path}", "info")
+        
+        # Plot efficiency vs threshold value
+        plot2_path = f"{output_prefix}_{variable_name}_eff_vs_value.png"
+        optimize_cuts.plot_scan_vs_value(rows, plot2_path, show=False)
+        logger.log(f"Saved threshold plot to: {plot2_path}", "info")
+    
+    result = {
+        'rows': rows,
+        'best': best,
+        'signal_eff': signal_eff,
+        'bkg_eff': bkg_eff,
+        'optimal_threshold': optimal_threshold,
+        'metric_value': best['metric']
+    }
+    
+    return result
+
+
+def optimize_multiple_cuts(combine_result, variables_dict, signal_code=168, background_codes=None,
+                          direction='greater', n_steps=200, metric='youden', output_prefix=None,
+                          save_csv=False, make_plots=False):
+    """
+    Optimize cuts on multiple variables and display summary.
+    
+    Args:
+        combine_result: Combined analysis result containing mc_count data
+        variables_dict: Dictionary mapping variable names to their data arrays
+                       e.g., {'maxr': maxr_data, 'd0': d0_data, 'tanDip': tandip_data}
+        signal_code: MC code identifying signal (default 168 for CE)
+        background_codes: List of background MC codes
+        direction: 'greater' or 'less'
+        n_steps: Number of threshold steps
+        metric: Optimization metric
+        output_prefix: Prefix for output files
+        save_csv: Save scan results to CSV
+        make_plots: Create visualization plots
+        
+    Returns:
+        Dictionary mapping variable names to optimization results
+    """
+    logger = Logger(print_prefix="[optimize_multiple_cuts]", verbosity=1)
+    
+    results = {}
+    
+    for var_name, var_data in variables_dict.items():
+        logger.log(f"Processing variable: {var_name}", "info")
+        result = optimize_cut_variable(
+            combine_result=combine_result,
+            variable_data=var_data,
+            signal_code=signal_code,
+            background_codes=background_codes,
+            direction=direction,
+            n_steps=n_steps,
+            metric=metric,
+            variable_name=var_name,
+            output_prefix=output_prefix,
+            save_csv=save_csv,
+            make_plots=make_plots
+        )
+        if result:
+            results[var_name] = result
+    
+    # Print summary table
+    if results:
+        logger.log("\n" + "═" * 80, "info")
+        logger.log("SUMMARY OF ALL OPTIMIZED CUTS", "info")
+        logger.log("═" * 80, "info")
+        
+        # Create summary table
+        summary_data = []
+        for var_name, res in results.items():
+            summary_data.append({
+                'Variable': var_name,
+                'Optimal Cut': f"{res['optimal_threshold']:.6g}",
+                'Signal Eff': f"{res['signal_eff']:.4f}",
+                'Bkg Eff': f"{res['bkg_eff']:.4f}",
+                'Metric': f"{res['metric_value']:.6g}"
+            })
+        
+        df_summary = pd.DataFrame(summary_data)
+        logger.log("\n" + df_summary.to_string(index=False), "info")
+        logger.log("═" * 80 + "\n", "info")
+    
+    return results
+
+
+def run_cut_optimization(file_list_path, sign="minus", cuts=None, locations='disk', jobs=1, 
+                        signal_code=168, background_codes=None, n_steps=200, metric='youden',
+                        output_prefix='cut_optimization', save_csv=True, make_plots=True,
+                        variables_to_optimize=None):
+    """
+    Driving function to run complete cut optimization workflow.
+    
+    Loads data, extracts variables, and optimizes cuts on multiple variables.
+    
+    Args:
+        file_list_path: Path to file list for processing
+        sign: Particle sign ('minus' or 'plus')
+        cuts: List of boolean cuts to apply (if None, uses default for sign)
+        locations: Data location ('disk' or 'tape')
+        jobs: Number of parallel jobs
+        signal_code: MC code for signal (default 168 for CE)
+        background_codes: List of background MC codes (default None = all non-signal)
+        n_steps: Number of threshold steps in scan
+        metric: Optimization metric ('youden' or 's_over_sqrtb')
+        output_prefix: Prefix for output files
+        save_csv: Save scan results to CSV files
+        make_plots: Create visualization plots
+        variables_to_optimize: Dict of {var_name: var_data} to optimize
+                               If None, uses default variables (maxr, d0, tanDip, etc.)
+        
+    Returns:
+        Dictionary with all optimization results
+    """
+    logger = Logger(print_prefix="[run_cut_optimization]", verbosity=1)
+    
+    logger.log("╔" + "═" * 78 + "╗", "info")
+    logger.log("║" + " CUT OPTIMIZATION WORKFLOW ".center(78) + "║", "info")
+    logger.log("╚" + "═" * 78 + "╝", "info")
+    
+    # Set default cuts if not provided
+    if cuts is None:
+        if sign == "minus":
+            cuts= [
+                True,  # 0 is_reco_electron
+                True,  # 1 has_downstream
+                True, # 2 has trk front
+                False,  # 3 good_trkqpid
+                False,  # 4 good_trkqual
+                False, # 5 within_t0
+                True,  # 6 within_t0err
+                True,  # 7 has_hits
+                False, # 8 within_lhr_maxl
+                False, # 9 within_d0
+                False, # 10 within_pitch_angle
+                False,  #11 has_st
+                False,  #12 no_opa
+                False,  #13 no_crv_veto
+                False,  #14 no_crv_quality
+                False,  #15 no_crv_timewindow
+                False,  #16 pz/pt
+                True,  #17 triggers
+                False,  #18 within_mom_time
+                False, #19 early time
+                False #20 reflected
+                ]
+        else:
+            cuts = [True, True, True, True, True, False, True, True, False, False, False, True, True, True, True, True, True, False, False, False, False]
+    
+    # Step 1: Load and process data
+    logger.log(f"\nStep 1: Loading data from {file_list_path}", "info")
+    ana_processor = AnaProcessor(file_list_path, jobs=jobs, sign=sign, cuts=cuts, location=locations)
+    results = ana_processor.execute()
+    combine_result = results["combined_data"]
+    
+    logger.log(f"Data loaded successfully", "info")
+    
+    # Step 2: Extract variables for optimization
+    logger.log(f"\nStep 2: Extracting variables for optimization", "info")
+    
+    selector = Select()
+    vector = Vector()
+    
+    # Select track front intersection
+    trk_front = selector.select_surface(combine_result['trkfit'], surface_name="TT_Front")
+    
+    # Surface masks
+    has_st = selector.has_ST(combine_result['trkfit'])
+    no_opa = selector.has_OPA(combine_result['trkfit'])
+    
+    test_mask = (trk_front) & (has_st)
+    
+    # Extract common track variables
+    trkfit_ent = ak.mask(combine_result['trkfit']["trksegs"], test_mask)
+    trksegpars = ak.mask(combine_result['trkfit']["trksegpars_lh"], test_mask)
+    trk = ak.mask(combine_result['trk'], test_mask)
+    
+    # Get momentum
+    mom_mag = vector.get_mag(trkfit_ent, 'mom')
+    
+    # Default variables to optimize if not provided
+    if variables_to_optimize is None:
+        variables_to_optimize = {
+            'trkqual': trk["trkqual.result"],
+            'trkpid': trk["trkpid.result"]
+        }
+    
+    logger.log(f"Variables extracted: {list(variables_to_optimize.keys())}", "info")
+    
+    # Step 3: Run optimization on all variables
+    logger.log(f"\nStep 3: Running optimization", "info")
+    logger.log(f"Signal code: {signal_code}, Metric: {metric}, Scan steps: {n_steps}", "info")
+    
+    opt_results = optimize_multiple_cuts(
+        combine_result=combine_result,
+        variables_dict=variables_to_optimize,
+        signal_code=signal_code,
+        background_codes=background_codes,
+        direction='greater',
+        n_steps=n_steps,
+        metric=metric,
+        output_prefix=output_prefix,
+        save_csv=save_csv,
+        make_plots=make_plots
+    )
+    
+    # Step 4: Save summary report
+    logger.log(f"\nStep 4: Saving results", "info")
+    
+    summary_file = f"{output_prefix}_summary.txt"
+    with open(summary_file, 'w') as f:
+        f.write("CUT OPTIMIZATION SUMMARY REPORT\n")
+        f.write(f"{'=' * 80}\n")
+        f.write(f"File List: {file_list_path}\n")
+        f.write(f"Particle Sign: {sign}\n")
+        f.write(f"Data Location: {locations}\n")
+        f.write(f"Signal Code: {signal_code}\n")
+        f.write(f"Background Codes: {background_codes if background_codes else 'All non-signal'}\n")
+        f.write(f"Optimization Metric: {metric}\n")
+        f.write(f"Scan Steps: {n_steps}\n")
+        f.write(f"\n{'=' * 80}\n")
+        f.write("OPTIMAL CUTS:\n")
+        f.write(f"{'=' * 80}\n\n")
+        
+        for var_name in sorted(opt_results.keys()):
+            res = opt_results[var_name]
+            f.write(f"{var_name}:\n")
+            f.write(f"  Threshold:           {res['optimal_threshold']:.6g}\n")
+            f.write(f"  Signal Efficiency:   {res['signal_eff']:.6f}\n")
+            f.write(f"  Background Eff:      {res['bkg_eff']:.6f}\n")
+            f.write(f"  Metric Value:        {res['metric_value']:.6g}\n\n")
+    
+    logger.log(f"Summary saved to: {summary_file}", "info")
+    
+    # Step 5: Create Python cut configuration
+    config_file = f"{output_prefix}_cuts.py"
+    with open(config_file, 'w') as f:
+        f.write("# Auto-generated cut configuration from optimization\n\n")
+        f.write("optimized_cuts = {\n")
+        for var_name in sorted(opt_results.keys()):
+            res = opt_results[var_name]
+            f.write(f"    '{var_name}': {res['optimal_threshold']:.6g},\n")
+        f.write("}\n\n")
+        f.write("efficiencies = {\n")
+        for var_name in sorted(opt_results.keys()):
+            res = opt_results[var_name]
+            f.write(f"    '{var_name}': {{'signal': {res['signal_eff']:.6f}, 'background': {res['bkg_eff']:.6f}}},\n")
+        f.write("}\n")
+    
+    logger.log(f"Cut configuration saved to: {config_file}", "info")
+    
+    logger.log(f"\n╔" + "═" * 78 + "╗", "info")
+    logger.log("║" + " OPTIMIZATION COMPLETE ".center(78) + "║", "info")
+    logger.log("╚" + "═" * 78 + "╝\n", "info")
+    
+    return opt_results
+
+
 # Create an instance of our custom processor
 def  main(args):
   """ main driver function to run analysis
   """
-  
+  print("Running main function")
   new = []
   
   if args.sign == "minus":
@@ -728,66 +1299,59 @@ def  main(args):
       False #20 reflected
     ]
 
-  old = [
-    True,  # 0 is_reco_electron
-    True,  # 1 has_downstream
-    True, # 2 has trk front
-    True,  # 3 good_trkqual
-    True,  # 4 good_trkpid
-    True, # 5 within_t0
-    True,  # 6 within_t0err
-    True,  # 7 has_hits
-    True, # 8 within_lhr_maxl
-    True, # 9 within_d0
-    True, # 10 within_pitch_angle
-    False,  #11 has_st
-    False,  #12 no_opa
-    True,  #13 no_crv_veto
-    False,  #14 no_crv_quality
-    False,  #15 no_crv_timewindow
-    False,  #16 pz/pt
-    False,  #17 triggers
-    False,  #18 within_mom_time
-    False #19 early time
-  ]
-  
+  print("starting main function with cuts:", new)
 
   files = [args.file]
   signs = [args.sign]
   locations = [args.loc]
   columns = ["Run1A"]
   cuts = [new]
-  #compare_datasets(files, [new], locations, columns, signs)
+  #compare_datasets(files, cuts, locations, columns, signs)
   fit_dataset(files, cuts, locations, columns, signs, args.proctype)
+  if args.proctype == "CE":
+    fig, ax = plot_theory_with_rle(
+      files=files,
+      cuts=cuts,
+      locations=locations,
+      signs=signs,
+      jobs=args.jobs,
+      rle_calib_dir="RLE/common"
+    )
+  print("Done plotting")
   return
   
 def PrintArgs(args):
   """
   prints users input parameters
   """
-  print("========= [RefAna/pyCount/process.py]✅  Analyzing with user opts: ===========")
+  print("========= [process.py]✅  Analyzing with user opts: ===========")
   print("file:", args.file)
   print("number of processes (njobs - optimal is 1 per file):", args.jobs)
   print("verbose: ", args.verbose)
   print("proctype:", args.proctype)
 if __name__ == "__main__":
+    print("DEBUG: Starting script", flush=True)
     # list of input arguments, defaults should be overridden
     parser = argparse.ArgumentParser(description='command arguments', formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--file", type=str, required=True, help="filename or file list name (text file list,fullpaths)")
     parser.add_argument("--loc", type=str, required=False, default='disk', help="location of files")
-    parser.add_argument("--sign", type=str, required="minus", help="sign of the signal being sought in words")
+    parser.add_argument("--sign", type=str, required=False, default='minus', help="sign of the signal being sought in words (default: minus)")
     parser.add_argument("--proctype", type=str, required=False, default='ensemble', help="process type (default: ensemble)")
     parser.add_argument("--jobs", type=int, required=False, default=1,help="use if more than one file, should be nfiles")
     parser.add_argument("--verbose", type=int, default=1, help="verbose")
+    
+    print("DEBUG: Parsing arguments", flush=True)
     args = parser.parse_args()
-    (args) = parser.parse_args()
+    print(f"DEBUG: Parsed args - file={args.file}, jobs={args.jobs}, sign={args.sign}", flush=True)
 
     # if verbose print the user input
     if(args.verbose > 0):
       PrintArgs(args)
     
+    print("DEBUG: Calling main()", flush=True)
     # run main function
     main(args)
+    print("DEBUG: Script completed", flush=True)
 
 
 

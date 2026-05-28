@@ -2,9 +2,11 @@ import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import awkward as ak
+import pickle as pkl
 
 from pyutils.pyselect import Select
 from pyutils.pyvector import Vector
+from helper import make_HistogramPDF
 
 # Publication-style matplotlib defaults: choose an available serif font
 import matplotlib.font_manager as mfm
@@ -347,11 +349,228 @@ class Compare():
       plt.savefig(filename)
       plt.show()
 
+    def convolve_with_rle(self, reco_data, theory_pdf, res_pdf, loss_pdf,
+                         mom_range=(90, 120), nbins=100, label="Theory ⊗ RLE",
+                         plot_title="Reco Momentum with Theory Convolution", output_file=None):
+        """
+        Overlay reconstructed momentum data with theory convolved with resolution and loss PDFs.
+        
+        Uses zfit ConvPDF to convolve theory with combined resolution+loss smearing:
+        reco_predicted = theory ⊗ (resolution ⊗ loss)
+        
+        Args:
+            reco_data (np.array): Reconstructed momentum data (raw values, not histogram)
+            theory_pdf (zfit.pdf.BasePDF): Theory momentum distribution (e.g., Chebyshev, Gaussian)
+            res_pdf (zfit.pdf.BasePDF): Resolution distribution PDF (reco - true)
+            loss_pdf (zfit.pdf.BasePDF): Energy loss distribution PDF (true - gen)
+            mom_range (tuple): (min, max) momentum range for plotting
+            nbins (int): Number of bins for data histogram
+            label (str): Label for the theoretical curve
+            plot_title (str): Title for the plot
+            output_file (str): Optional path to save plot
+            
+        Returns:
+            fig, ax: Matplotlib figure and axes objects
+        """
+        import zfit
+        
+        # Create figure
+        fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+        
+        # Plot reco data histogram
+        reco_counts, reco_bins, _ = ax.hist(reco_data, bins=nbins, range=mom_range,
+                                            label='Reco data', histtype='step',
+                                            color='blue', linewidth=2)
+        reco_bin_centers = (reco_bins[:-1] + reco_bins[1:]) / 2
+        bin_width = reco_bins[1] - reco_bins[0]
+        ax.errorbar(reco_bin_centers, reco_counts, yerr=np.sqrt(reco_counts),
+                   fmt='.', color='black', capsize=2, elinewidth=1)
+        
+        # Create momentum grid for plotting
+        mom_plot = np.linspace(mom_range[0], mom_range[1], 200).reshape(-1, 1)
+        
+        try:
+            # Pyfitter approach: ONE convolution only - theory ⊗ combined_kernel
+            # Key: convert theory to obs_gen ('x' space with wide bounds), then convolve with obs_res kernel
+            print(f"[Compare] Setting up FFT convolution (pyfitter single kernel)...", flush=True)
+            
+            # Observable space for theory PDF (wide bounds)
+            obs_gen = zfit.Space('x', limits=mom_range)      # Theory on 'x' with wide bounds
+            
+            print(f"[Compare] obs_gen: {obs_gen}", flush=True)
+            
+            # Number of bins for FFT
+            nbins_gen = 200
+            
+            # Convert theory_pdf from 'mom' observable to obs_gen ('x' with wide bounds)
+            print(f"[Compare] Converting theory PDF to obs_gen ('x') space...", flush=True)
+            
+            # Evaluate theory PDF on obs_gen bounds to create histogram representation
+            theory_x_vals = np.linspace(float(obs_gen.v1.lower), float(obs_gen.v1.upper), nbins_gen + 1)
+            theory_x_centers = theory_x_vals[:-1]
+            
+            # Evaluate theory PDF at bin centers to get probability density
+            theory_x_evals = zfit.run(theory_pdf.pdf(theory_x_centers.reshape(-1, 1))).flatten()
+            
+            # Create histogram PDF class and instantiate on obs_gen ('x')
+            HistPDF = make_HistogramPDF(theory_x_evals, theory_x_vals)
+            theory_pdf_gen = HistPDF(obs=obs_gen)
+            print(f"[Compare] Theory PDF converted to histogram on obs_gen ('x')", flush=True)
+            
+            # Get kernel parameters (if they exist - histogram PDFs may not have them)
+            print(f"[Compare] res_pdf type: {type(res_pdf)}", flush=True)
+            print(f"[Compare] loss_pdf type: {type(loss_pdf)}", flush=True)
+            
+            print(f"[Compare] Note: Using histogram-based kernels (capture actual GCB and truncated Landau shapes)", flush=True)
+            
+            # ===== STEP 1: theory ⊗ loss → p_true distribution =====
+            print(f"[Compare] STEP 1: Convolving theory ⊗ loss...", flush=True)
+            
+            # Extract actual loss kernel bounds from loss_pdf observable
+            loss_obs = loss_pdf.space
+            lower_loss = float(loss_obs.v1.lower)
+            upper_loss = float(loss_obs.v1.upper)
+            obs_loss = zfit.Space('x', limits=(lower_loss, upper_loss))
+            
+            lower_gen = float(obs_gen.v1.lower)
+            upper_gen = float(obs_gen.v1.upper)
+            
+            # Observable space for p_true (theory ⊗ loss)
+            # Blend subtraction and addition formulas for correct bounds
+            obs_p_true = zfit.Space('x', 
+                                    (lower_gen - upper_loss + lower_gen + lower_loss) / 2.0,
+                                    (upper_gen - lower_loss + upper_gen + upper_loss) / 2.0)
+            obs_full_loss = zfit.Space('x', 
+                                       (lower_gen - upper_loss + lower_gen + lower_loss) / 2.0,
+                                       (upper_gen - lower_loss + upper_gen + upper_loss) / 2.0)
+            
+            print(f"[Compare]   obs_loss: [{lower_loss:.1f}, {upper_loss:.1f}]", flush=True)
+            print(f"[Compare]   obs_p_true: [{float(obs_p_true.v1.lower):.1f}, {float(obs_p_true.v1.upper):.1f}]", flush=True)
+            
+            # First convolution: theory_pdf_gen ⊗ loss_pdf
+            # loss_pdf is already a histogram on obs_loss, use directly
+            pdf_p_true = zfit.pdf.FFTConvPDFV1(
+                func=theory_pdf_gen,
+                kernel=loss_pdf,
+                n=50,
+                obs=obs_p_true,
+                norm=obs_full_loss
+            )
+            print(f"[Compare]   ✓ pdf_p_true created (theory ⊗ loss)", flush=True)
+            
+            # ===== STEP 2: p_true ⊗ resolution → p_reco distribution =====
+            print(f"[Compare] STEP 2: Convolving p_true ⊗ resolution...", flush=True)
+            
+            # Extract actual resolution kernel bounds from res_pdf observable
+            res_obs = res_pdf.space
+            lower_res = float(res_obs.v1.lower)
+            upper_res = float(res_obs.v1.upper)
+            obs_res = zfit.Space('x', limits=(lower_res, upper_res))
+            
+            lower_p_true = float(obs_p_true.v1.lower)
+            upper_p_true = float(obs_p_true.v1.upper)
+            
+            # Observable space for p_reco (p_true ⊗ resolution)
+            # Blend subtraction and addition formulas for correct bounds
+            obs_p_reco = zfit.Space('x', 
+                                    (lower_p_true - upper_res + lower_p_true + lower_res) / 2.0,
+                                    (upper_p_true - lower_res + upper_p_true + upper_res) / 2.0)
+            obs_full_res = zfit.Space('x', 
+                                      (lower_p_true - upper_res + lower_p_true + lower_res) / 2.0,
+                                      (upper_p_true - lower_res + upper_p_true + upper_res) / 2.0)
+            
+            print(f"[Compare]   obs_res: [{lower_res:.1f}, {upper_res:.1f}]", flush=True)
+            print(f"[Compare]   obs_p_reco: [{float(obs_p_reco.v1.lower):.1f}, {float(obs_p_reco.v1.upper):.1f}]", flush=True)
+            
+            # Second convolution: pdf_p_true ⊗ res_pdf
+            # res_pdf is already a histogram on obs_res, use directly
+            pdf_p_reco = zfit.pdf.FFTConvPDFV1(
+                func=pdf_p_true,
+                kernel=res_pdf,
+                n=50,
+                obs=obs_p_reco,
+                norm=obs_full_res
+            )
+            print(f"[Compare]   ✓ pdf_p_reco created (p_true ⊗ resolution)", flush=True)
+            
+            # Use the final convolved PDF for evaluation
+            convolved_pdf = pdf_p_reco
+            obs_conv = obs_p_reco
+            
+            # Evaluate on final p_reco bounds
+            conv_lower = float(obs_p_reco.v1.lower)
+            conv_upper = float(obs_p_reco.v1.upper)
+            mom_plot_conv = np.linspace(conv_lower, conv_upper, 200).reshape(-1, 1)
+            print(f"[Compare] Evaluating final pdf_p_reco on [{conv_lower:.1f}, {conv_upper:.1f}]...", flush=True)
+            convolved_vals = zfit.run(convolved_pdf.pdf(mom_plot_conv)).flatten()
+            print(f"[Compare] Final convolved: min={np.min(convolved_vals):.6e}, max={np.max(convolved_vals):.6e}", flush=True)
+            
+            # Apply efficiency correction if available
+            try:
+                import os
+                eff_path = "RLE/common/efficiency.pkl"
+                if os.path.exists(eff_path):
+                    with open(eff_path, 'rb') as f:
+                        h_eff, eff_edges = pkl.load(f)
+                    
+                    # Interpolate efficiency at evaluation points
+                    eff_bin_centers = (eff_edges[:-1] + eff_edges[1:]) / 2
+                    eff_interp = np.interp(mom_plot_conv.flatten(), eff_bin_centers, h_eff, left=0, right=0)
+                    convolved_vals = convolved_vals * eff_interp
+                    print(f"[Compare] Applied efficiency correction: eff range [{np.min(eff_interp[eff_interp>0]):.4f}, {np.max(eff_interp):.4f}]", flush=True)
+                else:
+                    print(f"[Compare] No efficiency.pkl found at {eff_path}, skipping efficiency correction", flush=True)
+            except Exception as e:
+                print(f"[Compare] Warning: Failed to apply efficiency correction: {e}", flush=True)
+            
+            # Check for valid values
+            if np.any(np.isnan(convolved_vals)):
+                nan_count = np.sum(np.isnan(convolved_vals))
+                print(f"[Compare] WARNING: {nan_count}/{len(convolved_vals)} convolved values are NaN", flush=True)
+                raise ValueError("Convolution produced NaN")
+            
+            # Scale to match data integral
+            data_integral = np.sum(reco_counts)
+            convolved_integral = np.trapz(convolved_vals, mom_plot.flatten())
+            print(f"[Compare] Data integral: {data_integral}, Convolved integral: {convolved_integral:.6e}", flush=True)
+            
+            if convolved_integral > 0 and not np.isnan(convolved_integral):
+                convolved_scaled = convolved_vals * (data_integral / convolved_integral) * bin_width
+                ax.plot(mom_plot.flatten(), convolved_scaled, 'r-', linewidth=2.5, label=label)
+                print(f"[Compare] Successfully plotted convolved PDF", flush=True)
+            else:
+                print(f"[Compare] Invalid convolved integral, using theory fallback", flush=True)
+                raise ValueError(f"Invalid integral: {convolved_integral}")
+            
+        except Exception as e:
+            print(f"[Compare] Convolution failed ({e}), plotting theory instead", flush=True)
+            import traceback
+            traceback.print_exc()
+            
+            try:
+                # Fallback: plot theory only
+                theory_vals = zfit.run(theory_pdf.pdf(mom_plot)).flatten()
+                theory_integral = np.trapz(theory_vals, mom_plot.flatten())
+                data_integral = np.sum(reco_counts)
+                if theory_integral > 0:
+                    theory_scaled = theory_vals * (data_integral / theory_integral) * bin_width
+                    ax.plot(mom_plot.flatten(), theory_scaled, 'r--', linewidth=2, label=label + " (no convolution)")
+                    print(f"[Compare] Plotted theory PDF as fallback", flush=True)
+            except Exception as e2:
+                print(f"[Compare] Theory fallback also failed: {e2}", flush=True)
+        
+        # Styling
+        ax.set_xlabel("Momentum [MeV/c]")
+        ax.set_ylabel("Events per bin")
+        ax.set_title(plot_title)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        if output_file:
+            plt.savefig(output_file, dpi=100, bbox_inches='tight')
+            print(f"[Compare] Saved plot to {output_file}")
+        
+        return fig, ax
 
 
-
- 
-
-
-  
 
