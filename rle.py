@@ -10,6 +10,7 @@ import gc
 import numpy as np
 import awkward as ak
 import pickle as pkl
+import json
 import matplotlib.pyplot as plt
 from collections import OrderedDict
 import warnings
@@ -107,7 +108,7 @@ class RLE:
         fig, ax = plt.subplots(1, 1, figsize=(10, 8))
         
         # Fit range and binning
-        fit_range = (90, 120)
+        fit_range = (95, 110)
         n_bins = 63
         
         # Create histogram of generated momenta
@@ -170,6 +171,9 @@ class RLE:
         Args:
             data (dict): Processed data with 'trkmc' key
             output_dir (str): Output directory for plot
+            
+        Returns:
+            dict: Fitted coefficients {'c1', 'c2', 'c3', 'c4', 'c5'} or None if fit fails
         """
         self.logger.log("Fitting Chebyshev polynomial to origin momentum", "info")
         
@@ -201,7 +205,7 @@ class RLE:
         self.logger.log(f"Fitting {len(origin_mom_array)} events to Chebyshev polynomial", "info")
         
         # Fit range and setup
-        fit_range = (90, 120)
+        fit_range = (95, 110)
         n_bins = 100
         
         # Create figure
@@ -286,6 +290,7 @@ class RLE:
             ax1.text(0.5, 0.5, f"Fit Failed: {e}", transform=ax1.transAxes, 
                     fontsize=12, ha='center', va='center',
                     bbox=dict(boxstyle='round', facecolor='red', alpha=0.3))
+            result = None
         
         # Labels and legend
         ax1.set_ylabel('# of events per bin')
@@ -302,6 +307,18 @@ class RLE:
         plt.savefig(plot_file, dpi=150, bbox_inches='tight')
         self.logger.log(f"Origin momentum fit plot saved to {plot_file}", "info")
         plt.close()
+        
+        # Return fitted parameters
+        if result is not None:
+            return {
+                'c1': float(result.params[c1]['value']),
+                'c2': float(result.params[c2]['value']),
+                'c3': float(result.params[c3]['value']),
+                'c4': float(result.params[c4]['value']),
+                'c5': float(result.params[c5]['value']),
+            }
+        else:
+            return None
     
     def generate_skimmed_data(self, data, output_file="skimmed_flat_mom_MDC2025an.pkl"):
         """
@@ -636,10 +653,34 @@ def generate_rle_calibration(combined_data, output_dir="./common", run_fits=True
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
+    # Initialize calibration dictionary
+    calibration = {
+        # Landau loss distribution (fitted from flat electrons)
+        'landau': {
+            'loc': -0.600773,
+            'scale': 0.266484
+        },
+        # Generalized Crystal Ball resolution (fitted from flat electrons)
+        'gcb': {
+            'mu': 0.032545,
+            'sigmaL': 0.156945,
+            'alphaL': 1.182115,
+            'nL': 3.521308,
+            'sigmaR': 0.136071,
+            'alphaR': 1.575798,
+            'nR': 4.655049
+        }
+    }
+    
     # Step 1: Generate efficiency
     rle.logger.log("\nStep 1: Generating origin momentum fit...", "info")
     rle.generate_efficiency(combined_data, output_dir)
-    rle.fit_origin_momentum_chebyshev(combined_data, output_dir)
+    chebyshev_params = rle.fit_origin_momentum_chebyshev(combined_data, output_dir)
+    if chebyshev_params:
+        calibration['chebyshev'] = {
+            'coeffs': [1.0, chebyshev_params['c1'], chebyshev_params['c2'], 
+                       chebyshev_params['c3'], chebyshev_params['c4'], chebyshev_params['c5']]
+        }
     
     # Step 2: Generate skimmed data
     rle.logger.log("\nStep 2: Generating skimmed data...", "info")
@@ -665,6 +706,13 @@ def generate_rle_calibration(combined_data, output_dir="./common", run_fits=True
     rle.logger.log(f"  - skimmed_flat_mom_MDC2025an.pkl", "info")
     if fit_results:
         rle.logger.log(f"  - fits/*.png (resolution/loss plots)", "info")
+    
+    # Export calibration parameters to JSON
+    if calibration:
+        json_path = f"{output_dir}/calibration.json"
+        with open(json_path, 'w') as f:
+            json.dump(calibration, f, indent=2)
+        rle.logger.log(f"  - calibration.json (fitted parameters)", "info")
     
     # Load efficiency that was just created
     efficiency_data = None

@@ -26,6 +26,7 @@ from cosmics import Cosmics
 from rpc import RPC
 from analyze import Analyze
 from rle import generate_rle_calibration
+from RLE.rle_functions import apply_rle_convolution
 from spectrum import TheorySpectrum
 from pyutils.pycut import CutManager
 from pyutils.pylogger import Logger
@@ -633,9 +634,49 @@ def fit_dataset(files, cuts, locations, columns, signs, proctype):
     # Generate RLE calibration parameters for ensemble
     if proctype == "rle":
         rle_results = generate_rle_calibration(combine_result, "RLE/common", run_fits=True)
+    
+    # Apply RLE convolution to CeLL theory spectrum
+    if proctype == "convolution":
+        logger = Logger(print_prefix="[main:convolution]", verbosity=1)
+        logger.log("Applying RLE convolution to CeLL spectrum...", "info")
+        result = apply_ce_rle_convolution(
+            calibration_path="RLE/common/calibration.json",
+            mom_range=(95, 110),
+            binwidth=0.1,
+            output_plot="RLE/common/convolution_result.png"
+        )
+        if result:
+            logger.log("Convolution successful", "success")
+            # Could save result to file for later use
+        else:
+            logger.log("Convolution failed", "error")
+    
+    # Overlay RLE-convolved theory on reconstructed data
+    if proctype == "overlay":
+        logger = Logger(print_prefix="[main:overlay]", verbosity=1)
+        logger.log("Overlaying RLE-convolved theory on reco data...", "info")
+        
+        # Flatten reconstructed momenta from all files
+        reco_flat = ak.flatten(ak.concatenate(recomom), axis=None)
+        reco_array = np.array(reco_flat)
+        
+        logger.log(f"Total reco events: {len(reco_array)}", "info")
+        
+        overlay_result = overlay_convolved_theory_on_reco(
+            reco_momenta=reco_array,
+            calibration_path="RLE/common/calibration.json",
+            mom_range=(95, 110),
+            binwidth=0.1,
+            output_plot="RLE/common/reco_theory_overlay.png"
+        )
+        
+        if overlay_result:
+            logger.log(f"Overlay successful: {overlay_result['n_events']} events plotted", "success")
+        else:
+            logger.log("Overlay failed", "error")
 
 def plot_theory_with_rle(files, cuts, locations, signs, jobs=1, rle_calib_dir="RLE/common", 
-                        mom_range=(90, 120), binwidth=0.1, output_file=None):
+                        mom_range=(95, 110), binwidth=0.1, output_file=None):
     """
     Plot reconstructed momentum data overlaid with theory convolved with RLE.
     
@@ -701,14 +742,6 @@ def plot_theory_with_rle(files, cuts, locations, signs, jobs=1, rle_calib_dir="R
         # Load RLE calibration data
         logger.log("Loading RLE calibration...", "info")
         
-        print(f"\n{'='*70}", flush=True)
-        print(f"[plot_theory_with_rle] RLE CALIBRATION PIPELINE SUMMARY", flush=True)
-        print(f"{'='*70}", flush=True)
-        print(f"[plot_theory_with_rle] Theory: CeLL Leading Log (E_MAX={104.969:.3f} MeV)", flush=True)
-        print(f"[plot_theory_with_rle] Momentum range for plotting: {mom_range}", flush=True)
-        print(f"[plot_theory_with_rle] Loading calibration from: {rle_calib_dir}", flush=True)
-        print(f"{'='*70}\n", flush=True)
-        
         # Try to load skimmed data to get res and loss distributions
         skimmed_path = f"{rle_calib_dir}/skimmed_flat_mom_MDC2025an.pkl"
         try:
@@ -754,16 +787,6 @@ def plot_theory_with_rle(files, cuts, locations, signs, jobs=1, rle_calib_dir="R
             
             logger.log(f"Resolution kernel: histogram from {len(res_trimmed)} events, range=[{res_min_physical:.4f}, {res_max_physical:.4f}]", "info")
             
-            # ===== PRINT RESOLUTION PARAMETERS =====
-            print(f"\n[plot_theory_with_rle] ===== RESOLUTION PARAMETERS =====", flush=True)
-            print(f"[plot_theory_with_rle] Bins: {res_nbins}", flush=True)
-            print(f"[plot_theory_with_rle] Range: [{res_min_physical:.4f}, {res_max_physical:.4f}] MeV", flush=True)
-            print(f"[plot_theory_with_rle] Mean (trimmed): {res_mean:.4f} MeV", flush=True)
-            print(f"[plot_theory_with_rle] Std (trimmed): {res_std:.4f} MeV", flush=True)
-            print(f"[plot_theory_with_rle] Events used: {len(res_trimmed)} (from {len(res_data)} total)", flush=True)
-            print(f"[plot_theory_with_rle] Percentile range: 10-90th", flush=True)
-            print(f"[plot_theory_with_rle] ======================================\n", flush=True)
-            
             # Loss kernel: trim to tighter percentile range to exclude tail
             # Use 10th-90th percentile instead of 1st-99th to focus on core distribution
             loss_trimmed = loss_data[(loss_data > np.percentile(loss_data, 10)) & 
@@ -789,16 +812,6 @@ def plot_theory_with_rle(files, cuts, locations, signs, jobs=1, rle_calib_dir="R
             loss_pdf = LossHistPDF(obs=obs_loss_kernel)  # Centered on actual distribution!
             
             logger.log(f"Loss kernel: histogram from {len(loss_trimmed)} events, range=[{loss_min_physical:.4f}, {loss_max_physical:.4f}]", "info")
-            
-            # ===== PRINT LOSS PARAMETERS =====
-            print(f"\n[plot_theory_with_rle] ===== LOSS PARAMETERS =====", flush=True)
-            print(f"[plot_theory_with_rle] Bins: {loss_nbins}", flush=True)
-            print(f"[plot_theory_with_rle] Range: [{loss_min_physical:.4f}, {loss_max_physical:.4f}] MeV", flush=True)
-            print(f"[plot_theory_with_rle] Mean (trimmed): {loss_mean:.4f} MeV", flush=True)
-            print(f"[plot_theory_with_rle] Std (trimmed): {loss_std:.4f} MeV", flush=True)
-            print(f"[plot_theory_with_rle] Events used: {len(loss_trimmed)} (from {len(loss_data)} total)", flush=True)
-            print(f"[plot_theory_with_rle] Percentile range: 10-90th", flush=True)
-            print(f"[plot_theory_with_rle] =====================================\n", flush=True)
             
         except FileNotFoundError:
             logger.log(f"Warning: Could not find {skimmed_path}", "warn")
@@ -844,6 +857,226 @@ def plot_theory_with_rle(files, cuts, locations, signs, jobs=1, rle_calib_dir="R
         import traceback
         traceback.print_exc()
         return None, None
+
+
+def apply_ce_rle_convolution(calibration_path="RLE/common/calibration.json", 
+                             mom_range=(95, 110), binwidth=0.1, output_plot=None):
+    """
+    Apply RLE convolution to CeLL theory spectrum
+    
+    Uses the calibrated Chebyshev efficiency, GCB resolution, and Landau loss
+    to convolve the CeLL leading-log spectrum.
+    
+    Args:
+        calibration_path (str): Path to calibration.json from RLE
+        mom_range (tuple): (min, max) momentum range
+        binwidth (float): Bin width for momentum grid
+        output_plot (str): Optional path to save convolution steps plot
+        
+    Returns:
+        dict: {
+            'x_grid': momentum grid,
+            'theory': CeLL spectrum,
+            'after_loss': after loss convolution,
+            'after_resolution': after resolution convolution,
+            'final': after efficiency scaling,
+            'efficiency': efficiency values
+        }
+    """
+    logger = Logger(print_prefix="[apply_ce_rle_convolution]", verbosity=1)
+    
+    try:
+        logger.log("Creating CeLL theory spectrum...", "info")
+        theory = TheorySpectrum(mom_range=mom_range, binwidth=binwidth, verbosity=0)
+        
+        # Create momentum grid
+        x_grid = np.arange(mom_range[0], mom_range[1], binwidth)
+        
+        # Get theory PDF and evaluate on grid
+        theory_pdf = theory.get_pdf()
+        obs_mom = zfit.Space('p', limits=mom_range)
+        theory_vals = zfit.run(theory_pdf.pdf(x_grid.reshape(-1, 1))).flatten()
+        
+        logger.log(f"Theory spectrum: {len(x_grid)} points from {mom_range[0]} to {mom_range[1]} MeV", "info")
+        logger.log(f"Loading calibration from {calibration_path}...", "info")
+        
+        # Apply full RLE convolution
+        result = apply_rle_convolution(x_grid, theory_vals, calibration_path)
+        
+        logger.log("RLE convolution complete:", "info")
+        logger.log(f"  Theory integral: {np.trapz(result['theory'], x_grid):.4f}", "info")
+        logger.log(f"  After loss integral: {np.trapz(result['after_loss'], x_grid):.4f}", "info")
+        logger.log(f"  After resolution integral: {np.trapz(result['after_resolution'], x_grid):.4f}", "info")
+        logger.log(f"  Final (× efficiency) integral: {np.trapz(result['final'], x_grid):.4f}", "info")
+        logger.log(f"  Efficiency range: [{np.min(result['efficiency']):.3f}, {np.max(result['efficiency']):.3f}]", "info")
+        
+        # Optionally create plot
+        if output_plot:
+            logger.log(f"Creating convolution plot at {output_plot}...", "info")
+            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            
+            # Step 1: Theory
+            axes[0, 0].plot(result['x_grid'], result['theory'], 'b-', linewidth=2)
+            axes[0, 0].set_ylabel('PDF')
+            axes[0, 0].set_title('Step 1: CeLL Theory Spectrum')
+            axes[0, 0].grid(True, alpha=0.3)
+            
+            # Step 2: After loss
+            axes[0, 1].plot(result['x_grid'], result['after_loss'], 'g-', linewidth=2)
+            axes[0, 1].set_ylabel('PDF')
+            axes[0, 1].set_title('Step 2: Theory ⊗ Landau Loss')
+            axes[0, 1].grid(True, alpha=0.3)
+            
+            # Step 3: After resolution
+            axes[1, 0].plot(result['x_grid'], result['after_resolution'], 'r-', linewidth=2)
+            axes[1, 0].set_ylabel('PDF')
+            axes[1, 0].set_xlabel('Momentum [MeV]')
+            axes[1, 0].set_title('Step 3: (Theory ⊗ Loss) ⊗ GCB Resolution')
+            axes[1, 0].grid(True, alpha=0.3)
+            
+            # Step 4: Final with efficiency
+            ax_final = axes[1, 1]
+            ax_final.plot(result['x_grid'], result['final'], 'purple', linewidth=2, label='Final spectrum')
+            ax_final_eff = ax_final.twinx()
+            ax_final_eff.plot(result['x_grid'], result['efficiency'], 'orange', linewidth=1.5, linestyle='--', label='Efficiency')
+            ax_final.set_ylabel('Final PDF (purple)', color='purple')
+            ax_final_eff.set_ylabel('Efficiency (orange)', color='orange')
+            ax_final.set_xlabel('Momentum [MeV]')
+            ax_final.set_title('Step 4: Apply Chebyshev Efficiency')
+            ax_final.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig(output_plot, dpi=150, bbox_inches='tight')
+            logger.log(f"Plot saved to {output_plot}", "success")
+            plt.close()
+        
+        return result
+        
+    except Exception as e:
+        logger.log(f"Error in RLE convolution: {e}", "error")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def overlay_convolved_theory_on_reco(reco_momenta, calibration_path="RLE/common/calibration.json",
+                                     mom_range=(95, 110), binwidth=0.1, output_plot=None):
+    """
+    Overlay normalized convolved theory spectrum on reconstructed data
+    
+    Creates histogram of reco data, applies RLE convolution to theory,
+    normalizes theory to number of events, and plots both overlaid.
+    
+    Args:
+        reco_momenta (array): Reconstructed momentum values from data
+        calibration_path (str): Path to calibration.json from RLE
+        mom_range (tuple): (min, max) momentum range
+        binwidth (float): Bin width for momentum grid and histogram
+        output_plot (str): Path to save overlay plot
+        
+    Returns:
+        dict: {
+            'reco_momenta': filtered reco data,
+            'convolution_result': result from apply_ce_rle_convolution,
+            'n_events': number of events in reco
+        }
+    """
+    logger = Logger(print_prefix="[overlay_convolved_theory_on_reco]", verbosity=1)
+    
+    try:
+        # Filter reco data to mom_range
+        reco_filtered = reco_momenta[(reco_momenta >= mom_range[0]) & (reco_momenta <= mom_range[1])]
+        n_events = len(reco_filtered)
+        logger.log(f"Filtered reco data: {n_events} events in [{mom_range[0]}, {mom_range[1]}] MeV", "info")
+        
+        # Get convolved theory
+        logger.log("Generating convolved theory spectrum...", "info")
+        conv_result = apply_ce_rle_convolution(calibration_path=calibration_path,
+                                                mom_range=mom_range, binwidth=binwidth,
+                                                output_plot=None)  # Don't save conv plot here
+        
+        if conv_result is None:
+            logger.log("Failed to generate convolution result", "error")
+            return None
+        
+        x_grid = conv_result['x_grid']
+        after_resolution = conv_result['after_resolution']  # Use spectrum BEFORE efficiency
+        final_spectrum = conv_result['final']  # Keep for reference
+        
+        # Normalize spectrum BEFORE efficiency is applied
+        # The efficiency will then modulate the final shape without inflating values
+        integral_before_eff = np.trapz(after_resolution, x_grid)
+        if integral_before_eff > 0:
+            normalization_factor = n_events / integral_before_eff
+            theory_normalized = after_resolution * normalization_factor
+        else:
+            logger.log("Warning: after-resolution spectrum integral is 0 or negative", "warning")
+            theory_normalized = after_resolution
+            normalization_factor = 0
+        
+        logger.log(f"=== NORMALIZATION DEBUG ===", "info")
+        logger.log(f"Number of filtered reco events: {n_events}", "info")
+        logger.log(f"After-resolution spectrum integral (before efficiency): {integral_before_eff:.8f}", "info")
+        logger.log(f"Normalization factor (n_events / after_resolution_integral): {normalization_factor:.8f}", "info")
+        logger.log(f"Theory max value after normalization: {np.max(theory_normalized):.6f}", "info")
+        logger.log(f"Theory min value after normalization: {np.min(theory_normalized):.6f}", "info")
+        logger.log(f"Theory mean value after normalization: {np.mean(theory_normalized):.6f}", "info")
+        logger.log(f"Integral of normalized theory: {np.trapz(theory_normalized, x_grid):.8f} (should ≈ {n_events})", "info")
+        logger.log(f"Reco histogram integral (sum of counts): {np.sum(np.histogram(reco_filtered, bins=int((mom_range[1] - mom_range[0]) / binwidth), range=mom_range)[0])}", "info")
+        logger.log(f"Efficiency range: [{np.min(conv_result['efficiency']):.3f}, {np.max(conv_result['efficiency']):.3f}]", "info")
+        logger.log(f"===========================", "info")
+        
+        # Create overlay plot
+        if output_plot:
+            logger.log(f"Creating overlay plot at {output_plot}...", "info")
+            fig, ax = plt.subplots(figsize=(11, 8))
+            
+            # Reco histogram
+            n_bins = int((mom_range[1] - mom_range[0]) / binwidth)
+            counts, edges, patches = ax.hist(reco_filtered, bins=n_bins, range=mom_range,
+                                              label=f'Reco Data ({n_events} events)',
+                                              alpha=0.7, color='orange', edgecolor='none')
+            
+            # Convolved theory overlay (with efficiency modulation)
+            # Multiply by binwidth to convert from density to bin counts to match histogram
+            theory_with_eff = (theory_normalized * conv_result['efficiency']) * binwidth
+            ax.plot(x_grid, theory_with_eff, 'r-', linewidth=2.5,
+                   label='CeLL Theory ⊗ RLE (Landau+GCB) × Efficiency')
+            
+            # Also show efficiency as secondary axis
+            ax2 = ax.twinx()
+            ax2.plot(x_grid, conv_result['efficiency'], 'navy', linewidth=1.5, linestyle='--',
+                    label='Efficiency (Chebyshev)', alpha=0.7)
+            ax2.set_ylabel('Efficiency', color='navy', fontsize=13)
+            ax2.tick_params(axis='y', labelcolor='navy', labelsize=12)
+            
+            ax.set_xlabel('Reconstructed Momentum [MeV]', fontsize=14)
+            ax.set_ylabel('Events / {:.2f} MeV'.format(binwidth), fontsize=14)
+            ax.set_title('Reconstructed Spectrum vs RLE-Convolved Theory', fontsize=14, fontweight='bold')
+            ax.tick_params(axis='both', which='major', labelsize=12)
+            ax.tick_params(axis='both', which='minor', labelsize=10)
+            ax.minorticks_on()
+            ax.grid(False)
+            ax.legend(loc='upper right', fontsize=12)
+            
+            plt.tight_layout()
+            plt.savefig(output_plot, dpi=150, bbox_inches='tight')
+            logger.log(f"Overlay plot saved to {output_plot}", "success")
+            plt.close()
+        
+        return {
+            'reco_momenta': reco_filtered,
+            'convolution_result': conv_result,
+            'n_events': n_events,
+            'theory_normalized': theory_normalized
+        }
+        
+    except Exception as e:
+        logger.log(f"Error in overlay: {e}", "error")
+        import traceback
+        traceback.print_exc()
+        return None
+
 
 def WriteFittedData(data, min_v, max_v):
     """ Write data used in fit to csv (i,mom,time) Note: should be in format useful to BAT"""
@@ -1329,6 +1562,9 @@ def PrintArgs(args):
   print("number of processes (njobs - optimal is 1 per file):", args.jobs)
   print("verbose: ", args.verbose)
   print("proctype:", args.proctype)
+
+
+
 if __name__ == "__main__":
     print("DEBUG: Starting script", flush=True)
     # list of input arguments, defaults should be overridden
@@ -1336,7 +1572,7 @@ if __name__ == "__main__":
     parser.add_argument("--file", type=str, required=True, help="filename or file list name (text file list,fullpaths)")
     parser.add_argument("--loc", type=str, required=False, default='disk', help="location of files")
     parser.add_argument("--sign", type=str, required=False, default='minus', help="sign of the signal being sought in words (default: minus)")
-    parser.add_argument("--proctype", type=str, required=False, default='ensemble', help="process type (default: ensemble)")
+    parser.add_argument("--proctype", type=str, required=False, default='ensemble', help="process type: 'ensemble', 'cosmics', 'rpc', 'rle', 'convolution', 'overlay' (default: ensemble)")
     parser.add_argument("--jobs", type=int, required=False, default=1,help="use if more than one file, should be nfiles")
     parser.add_argument("--verbose", type=int, default=1, help="verbose")
     

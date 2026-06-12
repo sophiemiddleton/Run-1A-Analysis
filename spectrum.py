@@ -66,7 +66,7 @@ class TheorySpectrum:
     convolution with resolution and loss distributions.
     """
     
-    def __init__(self, mom_range=(90, 120), binwidth=0.1, verbosity=0):
+    def __init__(self, mom_range=(95, 110), binwidth=0.1, verbosity=0):
         """
         Initialize theory spectrum builder.
         
