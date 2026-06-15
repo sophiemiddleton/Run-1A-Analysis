@@ -115,7 +115,7 @@ class Fits():
       ax1.set_xlabel(str(val_label))
       ax1.set_xlim(lo,hi)
  
-      ax1.legend(ncol=len(columns))#,loc='upper center')
+      ax1.legend(loc='upper right', framealpha=0.9)
       for i in range(0,len(text_contents)):
         plt.text(0.1, 0.95-i*0.15, text_contents[i], 
                  transform=plt.gca().transAxes,

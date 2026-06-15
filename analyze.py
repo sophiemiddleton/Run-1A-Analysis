@@ -72,6 +72,7 @@ class Analyze:
             at_trk_back = self.selector.select_surface(data["trkfit"], surface_name="TT_Back")
             in_trk = (at_trk_front | at_trk_mid | at_trk_back)
 
+
             # 1. Electron tracks 
             # Reco track fit is electron
             if (str(self.sign) == "minus"):
@@ -121,7 +122,7 @@ class Analyze:
             self.logger.log("Defining downstream tracks cut", "max")
             is_downstream = selector.is_downstream(data['trkfit'])
     
-            is_downstream = ak.all( ~at_trk_mid | is_downstream, axis=-1) #~in_trk |
+            is_downstream = ak.any( ~in_trk | is_downstream, axis=-1) #~in_trk |
             #has_downstream = ak.any(is_downstream, axis=-1)
     
             cut_manager.add_cut(
@@ -133,12 +134,38 @@ class Analyze:
 
             # trksegs-level definition
             data["is_downstream"] = is_downstream
-            # trk-level definition
-            #data["has_downstream"] = has_downstream
-
-
-    
             
+            is_upstream = selector.is_upstream(data['trkfit'])
+            is_upstream = ak.any(at_trk_mid & is_upstream, axis=-1)
+         
+            cut_manager.add_cut(
+                name="no_upstream",
+                description="All tracks are downstream (no p_z < 0 in tracker)",
+                mask=~is_upstream,
+                active=True
+            )
+            data["no_upstream"] = is_upstream
+            
+
+
+            # trigger_new
+            # 1. Define the individual triggers
+            trig_cpr = selector.get_trigger(data["evt"], "trig_cpr_TrkDe_80m70p")
+            trig_apr = selector.get_trigger(data["evt"], "trig_apr_TrkDe_80m70p")
+
+            # 2. Combine them using the bitwise OR (|) operator
+            or_trigger = trig_cpr | trig_apr
+
+            # 3. Add the cut to your cut manager
+            cut_manager.add_cut( 
+                name="or_trigger",
+                description="or trigger selection",
+                mask=or_trigger,
+                active=True
+            )
+
+            data["or_trigger"] = or_trigger
+
             # MC truth electron cut: trkmc.pdg == 11
             # trkmcsim is a nested list per track (sim entries) so reduce to track-level
             """"
@@ -169,11 +196,23 @@ class Analyze:
                 active=active_has_trk_front
             )
         
+
+             # Reflection veto cut using pyutils.pyselect
+            # Veto events with reflected tracks (has loop helix fit)
+            is_reflected = selector.is_reflected(data['trkfit'])
+            cut_manager.add_cut(
+                name="no_reflected",
+                description="Veto tracks with reflections (no loop helix fit)",
+                mask=~is_reflected,
+                active= self.switch[19]  # Disabled by default, can be enabled via cut_switch
+            )
+
+
             # New TrkPID
-            good_trkpid = selector.select_trkpid(data["trk"], value=0.638)
+            good_trkpid = selector.select_trkpid(data["trk"], value=0.67)
             cut_manager.add_cut(
                 name="good_trkpid",
-                description="Track PID > 0.638",
+                description="Track PID > 0.67",
                 mask=good_trkpid,
                 active= self.switch[3] 
             )
@@ -192,20 +231,7 @@ class Analyze:
     
             
     
-            # 5. trksegs level
-            within_t0 = ((500 < data['trkfit']["trksegs"]["time"]) & 
-                            (data['trkfit']["trksegs"]["time"] < 1650))
-
-            # trk-level definition (the actual cut)
-            within_t0 = ak.all(~at_trk_front | within_t0, axis=-1)
-            cut_manager.add_cut( 
-                name="within_t0",
-                description="t0 at tracker (500 < t_0 < 1650 ns)",
-                mask=within_t0,
-                active= self.switch[5]
-            )
-    
-            #6. Loop helix track time err
+            # 5. Loop helix track time err
             within_t0err = ((data['trkfit']["trksegpars_lh"]["t0err"])  < 0.9)
 
             # trk-level definition (the actual cut)
@@ -214,16 +240,16 @@ class Analyze:
                 name="within_t0err",
                 description="t0err < 0.9",
                 mask=within_t0err,
-                active= self.switch[6]
+                active= self.switch[5]
             )
 
-            # 4. Minimum hits
+            # 6. Minimum hits
             has_hits = selector.has_n_hits(data["trk"], n_hits=20)
             cut_manager.add_cut(
                 name="has_hits",
                 description="Minimum of 20 active hits in the tracker",
                 mask=has_hits ,
-                active= self.switch[7]
+                active= self.switch[6]
             )
 
 
@@ -238,7 +264,7 @@ class Analyze:
                 name="within_lhr_max",
                 description="Loop helix maximum radius (450 < R_max < 680 mm)",
                 mask=within_lhr_max,
-                active= self.switch[8]
+                active= self.switch[7]
             )
     
             # 8. Distance from origin
@@ -251,42 +277,42 @@ class Analyze:
                 name="within_d0",
                 description="Distance of closest approach (d_0 < 100 mm)",
                 mask=within_d0,
-                active= self.switch[9] 
+                active= self.switch[8] 
         
             )
     
     
             # 9. Pitch angle
-            within_pitch_angle = ((0.5577350 < data['trkfit']["trksegpars_lh"]["tanDip"]) & 
+            within_pitch_angle = ((0.55 < data['trkfit']["trksegpars_lh"]["tanDip"]) & 
                                     (data['trkfit']["trksegpars_lh"]["tanDip"] < 1.0))
 
             # trk-level definition (the actual cut) 
             within_pitch_angle = ak.all(~at_trk_front | within_pitch_angle, axis=-1)
             cut_manager.add_cut(
                 name="within_pitch_angle",
-                description="Extrapolated pitch angle (0.5577350 < tan(theta_Dip) < 1.0)",
+                description="Extrapolated pitch angle (0.556 < tan(theta_Dip) < 1.0)",
                 mask=within_pitch_angle,
-                active= self.switch[10]
+                active= self.switch[9]
             )
     
             
     
-            # 11. New ST selection
+            # 10. New ST selection
             has_st  = selector.has_ST(data['trkfit'])
             cut_manager.add_cut(
                 name="has_st",
                 description="has Nst > 0",
                 mask=has_st,
-                active= self.switch[11]
+                active= self.switch[10]
             )
     
-            # 12. New OPA veto
+            # 11. New OPA veto
             no_OPA = selector.has_OPA(data['trkfit'])
             cut_manager.add_cut(
                 name="no_opa",
                 description="has N_opa == 0",
                 mask=no_OPA,
-                active= self.switch[12]
+                active= self.switch[11]
             )
     
 
@@ -342,7 +368,7 @@ class Analyze:
             quality_veto = ak.any(any_coinc_quality, axis=2)
             data["no_crv_quality"] = ~quality_veto
             try:
-                active_quality = self.switch[14]
+                active_quality = self.switch[13]
             except Exception:
                 active_quality = False
             cut_manager.add_cut(
@@ -358,7 +384,7 @@ class Analyze:
                 timewindow_veto = ak.zeros_like(ak.any(any_coinc, axis=2))
             data["no_crv_timewindow"] = ~timewindow_veto
             try:
-                active_timewindow = self.switch[15]
+                active_timewindow = self.switch[14]
             except Exception:
                 active_timewindow = False
             cut_manager.add_cut(
@@ -372,7 +398,7 @@ class Analyze:
             veto = ak.any(any_coinc, axis=2)
             data["no_crv_veto"] = ~veto
             try:
-                active_veto = self.switch[13]
+                active_veto = self.switch[12]
             except Exception:
                 active_veto = False
             cut_manager.add_cut(
@@ -381,6 +407,10 @@ class Analyze:
                 mask=~veto,
                 active= active_veto
             )
+
+
+
+
 
             # 13. pz/pt cut: compute pz/pt robustly using pyutils.Vector
             try:
@@ -405,7 +435,7 @@ class Analyze:
 
             # Reduce segment-level ratio to a track-level mask: require 0.5 < pz/pt < 1.0
             try:
-                mask_seg = (pz_over_pt > 0.5) & (pz_over_pt < 1.0)
+                mask_seg = (pz_over_pt > 0.5) & (pz_over_pt < 0.95)
                 mask_pzpt = ak.all(~at_trk_front | mask_seg, axis=-1)
             except Exception:
                 mask_pzpt = ak.zeros_like(ak.any(~at_trk_front, axis=-1))
@@ -415,21 +445,12 @@ class Analyze:
 
             cut_manager.add_cut(
                 name="pz_over_pt",
-                description="Track-level cut: 0.5 < pz/pt < 1.0 (pt = transverse mag)",
+                description="Track-level cut: 0.5 < pz/pt < 0.95 (pt = transverse mag)",
                 mask=mask_pzpt,
-                active= self.switch[16]
+                active= self.switch[15]
             )
 
-            # 11. Trigger test
-            good_trigger = selector.get_triggers(data["evt"], ["trig_cpr_TrkDe_80m70p","trig_apr_TrkDe_80m70p","trig_tpr_TrkDe_80m70p"])
-            cut_manager.add_cut(
-                name="good_trigger",
-                description="trigger passed",
-                mask=good_trigger,
-                active= self.switch[17]
-            )
-            data["good_trigger"] = good_trigger
-            
+
             # momentum selection
             vector = Vector()
             trkfit_ent = ak.mask(data['trkfit']["trksegs"], at_trk_front)
@@ -440,7 +461,7 @@ class Analyze:
                 name="in_mom_range",
                 description=" 95 < mom < 115",
                 mask=in_mom_range,
-                active=self.switch[18]
+                active=self.switch[17]
             )
 
             within_t0_early = ((0 < data['trkfit']["trksegs"]["time"]) & 
@@ -452,18 +473,44 @@ class Analyze:
                 name="within_t0_early",
                 description="t0 at tracker mid (0 < t_0 < 700 ns)",
                 mask=within_t0_early,
-                active= self.switch[19]
+                active= self.switch[18]
             )
 
-            # Reflection veto cut using pyutils.pyselect
-            # Veto events with reflected tracks (has loop helix fit)
-            is_reflected = selector.is_reflected(data['trkfit'])
-            cut_manager.add_cut(
-                name="no_reflected",
-                description="Veto tracks with reflections (no loop helix fit)",
-                mask=~is_reflected,
-                active= self.switch[20]  # Disabled by default, can be enabled via cut_switch
+           
+            # 12. trksegs level - within_t0 (moved to end)
+            within_t0 = ((640 < data['trkfit']["trksegs"]["time"]) & 
+                            (data['trkfit']["trksegs"]["time"] < 1650))
+
+            # trk-level definition (the actual cut)
+            within_t0 = ak.all(~at_trk_front | within_t0, axis=-1)
+            cut_manager.add_cut( 
+                name="within_t0",
+                description="t0 at tracker (640 < t_0 < 1650 ns) ",
+                mask=within_t0,
+                active= self.switch[20]
             )
+
+            # Signal region cut: momentum and time selection
+            # Momentum: 103.6 < mom < 104.9
+            signal_mom_mask = ((103.34 < mom_mag) & (mom_mag < 104.74))
+            signal_mom_mask = ak.all(~at_trk_front | signal_mom_mask, axis=-1)
+   
+            # Time: 640 < t < 1650 ns
+            signal_time_mask = ((640 < data['trkfit']["trksegs"]["time"]) & 
+                                (data['trkfit']["trksegs"]["time"] < 1650))
+            signal_time_mask = ak.all(~at_trk_front | signal_time_mask, axis=-1)
+            
+            # Combined signal region cut
+            signal_region = signal_mom_mask & signal_time_mask
+            cut_manager.add_cut(
+                name="signal_region",
+                description="Signal region: 103.34 < mom < 104.74 MeV, 640 < t < 1650 ns",
+                mask=signal_region,
+                active= self.switch[21]
+            )
+            data["signal_region"] = signal_region
+    
+            
     
             """
             

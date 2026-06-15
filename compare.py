@@ -3,6 +3,7 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import awkward as ak
 import pickle as pkl
+from pathlib import Path
 
 from pyutils.pyselect import Select
 from pyutils.pyvector import Vector
@@ -18,14 +19,14 @@ mpl.rcParams.update({
   'font.family': 'serif',
   'font.serif': [chosen_serif],
   'font.size': 10,
-  'axes.titlesize': 12,
-  'axes.labelsize': 10,
+  'axes.titlesize': 9,
+  'axes.labelsize': 9,
   'xtick.labelsize': 9,
   'ytick.labelsize': 9,
-  'legend.fontsize': 9,
+  'legend.fontsize': 14,
   'axes.titleweight': 'bold',
   'axes.labelweight': 'normal',
-  'axes.linewidth': 1.0,
+  'axes.linewidth': 1.2,
   'grid.linewidth': 0.5,
   'figure.dpi': 150,
 })
@@ -62,13 +63,13 @@ class Compare():
       sets = []
 
       if residuals:
-        fig, (ax1, ax2) = plt.subplots(2,1, height_ratios=[3,1])
+        fig, (ax1, ax2) = plt.subplots(2, 1, height_ratios=[3, 1], figsize=(8, 9))
       else:
-        fig, (ax1) = plt.subplots(1,1)
+        fig, ax1 = plt.subplots(1, 1, figsize=(8, 9))
 
       # publication-friendly palette (matplotlib 'tab10' style, 8 colors)
-      cols = ['#1f77b4', "#ffe30e", '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', "#ff8000"]
-      labs = ['Cosmic','int. RPC','ext. RPC','int. RMC','ext. RMC','IPA Decays','DIO', 'Signal']
+      cols = ['#1f77b4', "#ffe30e", '#2ca02c',  '#e377c2', "#ff8000"] #'#d62728', '#9467bd', '#8c564b',
+      labs = ['Cosmic-Induced','Internal RPC','External RPC','DIO', 'Signal'] #'int. RMC','ext. RMC','IPA Decays',
       styles = ['bar','step','step']
       lines=["","-","--"]
       alphas = [1,1,1]
@@ -85,13 +86,15 @@ class Compare():
         val_erpc = np.array(ak.flatten(val_erpc,axis=None))
         val_irpc = val.mask[mc_count[i] == 179]
         val_irpc = np.array(ak.flatten(val_irpc,axis=None))
+        """
         val_ermc = val.mask[mc_count[i] == 171]
         val_ermc = np.array(ak.flatten(val_ermc,axis=None))
         val_irmc = val.mask[mc_count[i] == 172]
         val_irmc = np.array(ak.flatten(val_irmc,axis=None))
         val_ipa = val.mask[mc_count[i] == 0]
         val_ipa = np.array(ak.flatten(val_ipa,axis=None))
-        sets.append([val_cosmics,val_irpc,val_erpc,val_irmc,val_ermc, val_ipa, val_dio, val_signal])
+        """
+        sets.append([val_cosmics,val_irpc,val_erpc,val_dio, val_signal]) #val_irmc,val_ermc, val_ipa, 
       bin_centers = []
       bin_contents = []
       bin_errors = []
@@ -100,7 +103,7 @@ class Compare():
       for i in range(0,len(sets)):
         if use_log:
           ax1.set_yscale('log')
-        dummy_handle = ax1.plot([], marker="",color='white', label=columns[i])
+        #dummy_handle = ax1.plot([], marker="",color='white', label=columns[i])
         n, bins, patch = ax1.hist(sets[i], range=(lo,hi), color=cols, label=labs, bins=nbins, histtype=styles[i], alpha=alphas[i], stacked=True, density=density)#, edgecolor='black', linewidth=0.8)
         # ensure black edge lines on returned patches (works for Rectangle and Patch collections)
         try:
@@ -133,29 +136,25 @@ class Compare():
         ax1.errorbar(bin_centers[mask_nonzero], n_combined[mask_nonzero], 
                     yerr=errors_combined[mask_nonzero], fmt='o', 
                     capsize=3, capthick=1.5, markersize=4, color='black', 
-                    elinewidth=1, label=f'{columns[i]} (full sample)' if i == 0 else '')
+                    elinewidth=1, label=f'Mock Data' if i == 0 else '')
 
       ax1.set_xlabel(str(val_label))
-      ax1.set_xlim(lo,hi)
-      #ax1.set_ylim(0,100)
+      ax1.set_ylabel('Events per 0.21 MeV/c')
+      ax1.set_xlim(lo,hi)      
+      #ax1.set_ylim(ymin=1, ymax=40)      #ax1.set_ylim(0,100)
       # draw cuts
       
       if(len(cut_lo) !=0):
-        ax1.plot(cut_lo, [0,40], color='black', linestyle='--') #110
+        ax1.plot(cut_lo, [0,1000], color='black', linestyle='--') #110
       if(len(cut_hi) !=0):
-        ax1.plot(cut_hi, [0,40], color='black', linestyle='--')
+        ax1.plot(cut_hi, [0,1000], color='black', linestyle='--')
       
-        # place legend off the right side of the axes to avoid overlapping data
-        # make only the first legend label bold (dummy handle)
-        leg = ax1.legend(ncol=len(columns), loc='upper left', bbox_to_anchor=(1.02, 1), borderaxespad=0)
-        texts = leg.get_texts()
-        if texts:
-          texts[0].set_fontweight('bold')
+        ax1.legend(loc='upper right', framealpha=0.9)
 
       if residuals:
         # residuals: S/sqrt(B) where S=signal (component 7), B=sum of all other components
-        signal = bin_contents[0][7]  # Signal counts from first dataset
-        background = np.sum(bin_contents[0][:7], axis=0)  # Sum of all background components
+        signal = bin_contents[0][4]  # Signal counts from first dataset FIXME 77777777
+        background = np.sum(bin_contents[0][:4], axis=0)  # Sum of all background components
         
         # Calculate S/sqrt(B+1), adding 1 to regularize pure signal regions
         residuals = signal / np.sqrt(np.maximum(background, 1))
@@ -173,16 +172,31 @@ class Compare():
         ax2.set_xlabel(str(val_label))
         ax2.set_xlim(lo,hi)
         ax2.set_ylabel(r"S / $\sqrt{B}$")
-      # leave room on the right for the legend when saving
-      plt.tight_layout(rect=[0, 0, 0.87, 1])
-      # place the canvas label anchored to the figure top-left so it remains there
-      legend_fs = mpl.rcParams.get('legend.fontsize', 12)
-      fig.text(0.01, 0.995, "Mu2e Simulation", fontsize=legend_fs, fontweight='bold', fontstyle='italic',
-           ha='left', va='top', transform=fig.transFigure, zorder=100)
+      # Resize plot area to avoid overlapping title - reserve space at top
+      fig.tight_layout(rect=[0, 0, 1, 0.92])
+      legend_fs = mpl.rcParams.get('legend.fontsize', 14)
+
+      # Search for logo in multiple locations
+      logo_paths = ['mu2e_logo_oval.png', 'useful/mu2e_logo_oval.png', '../useful/mu2e_logo_oval.png']
+      logo_to_use = None
+      for logo_path in logo_paths:
+          if Path(logo_path).exists():
+              logo_to_use = logo_path
+              break
+      
+      if logo_to_use:
+          try:
+              from PIL import Image
+              logo = Image.open(logo_to_use)
+              ax_logo = fig.add_axes([0.02, 0.93, 0.1, 0.09])
+              
+              ax_logo.imshow(logo)
+              ax_logo.axis('off')
+          except Exception: pass
+      
+      ax1.text(0.15, 0.98, "Mu2e Simulation (Preliminary - Summer 2026)", fontsize=14, fontweight='bold', ha='left', va='top', transform=ax1.figure.transFigure, zorder=100)
       if(len(val_signal) != 0): 
-        ax1.text(0.92, 0.97, r"$R_{\mu e} = 1 \times 10^{-13}$", fontsize=legend_fs, 
-           ha='right', va='top', transform=ax1.transAxes, zorder=100,
-           bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgrey', edgecolor='black', alpha=0.8))
+         ax1.text(0.35, 0.97, r"$R_{\mu e} = 1 \times 10^{-13}$" + "\n" + "t = 28 days" + "\n" + r"$N_{\mathrm{POT}} = 7.3 \times 10^{18}$" , fontsize=14, ha='right', va='top', transform=ax1.transAxes, zorder=100, bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgrey', edgecolor='black', alpha=0.8))
       plt.savefig(str(filenames)+"_selection.png", bbox_inches='tight')
       plt.show()
       
@@ -245,7 +259,7 @@ class Compare():
 
       ax1.set_xlabel(str(val_label))
       ax1.set_xlim(lo,hi)
-      ax1.legend(ncol=len(columns))
+      ax1.legend(loc='upper right', framealpha=0.9)
 
       # residuals for signal only
       residuals = []

@@ -2,6 +2,7 @@ print("DEBUG: Importing modules...", flush=True)
 
 import gc
 import sys
+import traceback
 from datetime import datetime
 import numpy as np
 
@@ -25,13 +26,21 @@ from compare import Compare
 from cosmics import Cosmics
 from rpc import RPC
 from analyze import Analyze
-from rle import generate_rle_calibration
+from rle import (
+    generate_rle_calibration,
+    plot_theory_with_rle,
+    apply_ce_rle_convolution,
+    fit_convolved_spectrum_to_data,
+    overlay_convolved_theory_on_reco_with_constraints,
+    overlay_convolved_theory_on_reco
+)
 from RLE.rle_functions import apply_rle_convolution
 from spectrum import TheorySpectrum
 from pyutils.pycut import CutManager
 from pyutils.pylogger import Logger
 import optimize_cuts
 from helper import make_HistogramPDF
+from rle_v2 import RLE_v2
 
 
 #from fits import Fits
@@ -84,6 +93,9 @@ class AnaProcessor(Skeleton):
                 "trk.nactive", 
                 "trk.pdg", 
                 "trk.status",
+                "trk.opainter",
+                "trk.chisq",
+                "trk.ndof",
                 "trkqual.valid",
                 "trkqual.result",
                 "trkpid.valid",
@@ -194,6 +206,12 @@ class AnaProcessor(Skeleton):
                 results = self.analyse.execute(data, file_name)
                 analysis_time = time.time() - analysis_start
                 
+                # Debug: check result type
+                if not isinstance(results, dict):
+                    self.logger.log(f"[FILE {just_filename}] WARNING: analyse.execute() returned {type(results).__name__}, expected dict!", "warning")
+                    if isinstance(results, tuple) and len(results) == 2:
+                        self.logger.log(f"[FILE {just_filename}] Got tuple with {len(results)} elements. First element type: {type(results[0]).__name__}", "warning")
+                
                 elapsed = time.time() - file_start
                 
                 # Get memory after
@@ -259,6 +277,18 @@ class AnaProcessor(Skeleton):
             if result is None or len(result) == 0:
                 skipped_count += 1
                 continue
+            
+            # Debug: check result type
+            if not isinstance(result, dict):
+                print(f"[postprocess] WARNING: Result {i} is type {type(result).__name__}, expected dict. Skipping.")
+                skipped_count += 1
+                continue
+                
+            if "filtered_data" not in result or "cut_stats" not in result:
+                print(f"[postprocess] WARNING: Result {i} missing expected keys. Has keys: {list(result.keys())}. Skipping.")
+                skipped_count += 1
+                continue
+            
             arrays_to_combine.append(result["filtered_data"])
             cut_flow_list.append(result["cut_stats"])
         
@@ -456,6 +486,11 @@ def compare_datasets( files, cuts, locations, columns, signs):
     times = []
     crv = []
     trkpid = []
+
+    chisqs = []
+    ndofs = []
+    chiperdof = []
+    
     
     comparison = Compare()
     #fit = Fits()
@@ -519,6 +554,9 @@ def compare_datasets( files, cuts, locations, columns, signs):
       # plot cut distributions
       test_mask = (trk_front) & (has_st) #& (no_opa)& (has_st)
       
+
+      print_passing_events(combine_result, test_mask, output_file="passing_events_count.txt")
+
       # for CRV:
       # Get track and coincidence times
       trk_times = combine_result['trkfit']["trksegs"]["time"][trk_front]  # events × tracks × segments
@@ -530,6 +568,9 @@ def compare_datasets( files, cuts, locations, columns, signs):
       # Calculate time differences
       dt = abs(trk_broadcast - coinc_broadcast)
       
+      
+
+
       nST.append(ak.sum(selector.select_surface(combine_result['trkfit'], surface_name="ST_Foils"), axis=-1))
       nOPA.append(ak.sum(selector.select_surface(combine_result['trkfit'], surface_name="OPA"), axis=-1))
       rmax.append(ak.mask(combine_result['trkfit']["trksegpars_lh"],test_mask)['maxr']) 
@@ -539,21 +580,27 @@ def compare_datasets( files, cuts, locations, columns, signs):
       trkqual.append(ak.mask(combine_result['trk'],test_mask)["trkqual.result"])
       trkpid.append(ak.mask(combine_result['trk'],test_mask)["trkpid.result"])
       active.append(ak.mask(combine_result['trk'],test_mask)["trk.nactive"])
+      chisqs_masked = ak.mask(combine_result['trk'],test_mask)["trk.chisq"]
+      ndofs_masked = ak.mask(combine_result['trk'],test_mask)["trk.ndof"]
+      chisqs.append(chisqs_masked)
+      ndofs.append(ndofs_masked)
+      chiperdof.append(chisqs_masked / ndofs_masked)
+
       recomom.append(mom_mag)
       times.append(time)
       losses.append(loss)
       truemom.append(mom_mag_mc)
       resolutions.append(resolution)
       crv.append(dt)
-    cosmics.fit_momentum(recomom)
+    #cosmics.fit_momentum(recomom)
     prefix = "eplus" if str(signs[i]).lower() == "plus" else "eminus"
     comparison.plot_particle_counts(mc_count, columns, plot_prefix=prefix)
     
     if signs[i] == "minus":
-       startmom = 98
-       endmom = 110
-       nbins = 25
-       comparison.plot_variable(recomom, r"$p_e$ [MeV/c]",f"{prefix}_recomom", startmom, endmom, [103.6,103.6],[104.8,104.8], mc_count,columns, nbins=nbins)
+       startmom = 99
+       endmom = 106
+       nbins = 34
+       comparison.plot_variable(recomom, r"Reconstructed Momentum [MeV/c]",f"{prefix}_recomom", startmom, endmom, [103.34,103.34],[104.74,104.74], mc_count,columns, nbins=nbins)
     else:
         startmom = 85
         endmom = 97
@@ -569,6 +616,10 @@ def compare_datasets( files, cuts, locations, columns, signs):
     comparison.plot_variable(trkpid, "trkpid", f"{prefix}_trkpid", 0,1,[0.6,0.6], [0.6, 0.6], mc_count,columns)
     comparison.plot_variable(t0err, "t0err",f"{prefix}_t0err", 0,1, [0.9,0.9],[0.9,0.9], mc_count,columns)
     comparison.plot_variable(active, "nactive",f"{prefix}_nactive", 0,50, [20,20],[0.9,0.9], mc_count,columns)
+    comparison.plot_variable(chisqs, "chisq",f"{prefix}_chi", 0,200, [1,1],[1,1], mc_count,columns)
+    comparison.plot_variable(ndofs, "ndof",f"{prefix}_ndof", 0,50, [1,1],[1,1], mc_count,columns)
+    comparison.plot_variable(chiperdof, "chi2/dof",f"{prefix}_chidof", 0,10, [0,0],[0,0], mc_count,columns)
+
     
     comparison.plot_variable(times, "Time at TrkEnt [ns]",f"{prefix}_time", 0, 1700, [640,640],[1650,1650], mc_count,columns)
     comparison.plot_variable(truemom, "True Momentum at TrkEnt [MeV/c]",f"{prefix}_truemom", startmom, endmom, [103.9,103.9],[105.1,105.1], mc_count,columns)
@@ -592,6 +643,12 @@ def fit_dataset(files, cuts, locations, columns, signs, proctype):
     recomom = []
     mc_count = []
     comparison = Compare()
+    resolutions = []
+    resolutions_origin = []
+    originmom = []
+    losses = []
+    times = []
+    truemom = []
     #fit = Fits()
     for i, fil in enumerate(files):
       ana_processor = AnaProcessor(fil, args.jobs, signs[i], cuts[i], locations[i], proctype)
@@ -622,9 +679,32 @@ def fit_dataset(files, cuts, locations, columns, signs, proctype):
       vector = Vector()
       mom_mag = vector.get_mag(trkfit_ent ,'mom')
       recomom.append(mom_mag)
+      trk_front_mc = selector.select_surface(combine_result['trkfit'], surface_name="TT_Front",branch_name="trksegsmc")
+      trkfit_ent_mc = ak.mask(combine_result['trkfit']["trksegsmc"], trk_front_mc)#combine_result['trkfit']["trksegsmc"].mask[(trk_front_mc) ]
 
+      
+      mom_mag_mc = vector.get_mag(trkfit_ent_mc ,'mom')
+
+      # get resolution:
+      resolution = comparison.compare_resolution(mom_mag,mom_mag_mc)
+      
+      # for loss studies:
+      origin = ak.mask(combine_result['trkmc']["trkmcsim"] , (combine_result['trkmc']["trkmcsim"]["rank"] == 0) & (combine_result['trkmc']["trkmcsim"]["nhits"] > 0))
+      originmom.append((vector.get_mag(origin,'mom')))
+
+
+
+      # get resolution:
+      resolution = comparison.compare_resolution(mom_mag_mc, mom_mag)
+      resolution_origin = comparison.compare_resolution(mom_mag,(vector.get_mag(origin,'mom')))
+      loss  = comparison.compare_resolution( (vector.get_mag(origin,'mom')), mom_mag_mc)
+      #times.append(time)
+      losses.append(loss)
+      truemom.append(mom_mag_mc)
+      resolutions_origin.append(resolution_origin)
+      resolutions.append(resolution)
     if proctype == "ensemble":
-        WriteFittedData(recomom, 95, 110)
+        WriteFittedData(recomom, 90, 120)
     if proctype == "cosmics":
         cosmics = Cosmics()
         cosmics.fit_momentum(recomom)
@@ -634,6 +714,14 @@ def fit_dataset(files, cuts, locations, columns, signs, proctype):
     # Generate RLE calibration parameters for ensemble
     if proctype == "rle":
         rle_results = generate_rle_calibration(combine_result, "RLE/common", run_fits=True)
+    if proctype == "rle_no_fit":
+        rle_results = generate_rle_calibration(combine_result, "RLE/common", run_fits=False)
+    if proctype == "rle_v2":
+            rlev2 = RLE_v2()
+            rlev2.fit_momentum(originmom, 90, 120, opt="poly", label = "Origin Momentum [MeV/c]")
+            rlev2.fit_momentum(losses, -5,0,opt="landau",label = "Origin Momentum - True Momentum at TrkEnt [MeV/c]")
+            #rlev2.fit_time(times, 450,1695,opt="piexp",label = "time at TrkFront [ns]")
+            rlev2.fit_momentum(resolutions, -2,1,opt="dscb", label = "Reco - True Momentum at TrkEnt [MeV/c]")
     
     # Apply RLE convolution to CeLL theory spectrum
     if proctype == "convolution":
@@ -654,7 +742,7 @@ def fit_dataset(files, cuts, locations, columns, signs, proctype):
     # Overlay RLE-convolved theory on reconstructed data
     if proctype == "overlay":
         logger = Logger(print_prefix="[main:overlay]", verbosity=1)
-        logger.log("Overlaying RLE-convolved theory on reco data...", "info")
+        logger.log("Overlaying RLE-convolved theory on reco data with fitting...", "info")
         
         # Flatten reconstructed momenta from all files
         reco_flat = ak.flatten(ak.concatenate(recomom), axis=None)
@@ -662,420 +750,59 @@ def fit_dataset(files, cuts, locations, columns, signs, proctype):
         
         logger.log(f"Total reco events: {len(reco_array)}", "info")
         
-        overlay_result = overlay_convolved_theory_on_reco(
+        overlay_result = overlay_convolved_theory_on_reco_with_constraints(
             reco_momenta=reco_array,
             calibration_path="RLE/common/calibration.json",
             mom_range=(95, 110),
             binwidth=0.1,
+            constraint_margin=0.20,  # Moderate ±20% margin
+            do_fit=True,
             output_plot="RLE/common/reco_theory_overlay.png"
         )
         
         if overlay_result:
             logger.log(f"Overlay successful: {overlay_result['n_events']} events plotted", "success")
+            if overlay_result.get('fit_result'):
+                logger.log(f"  Fit: χ²/dof={overlay_result['fit_result']['chi2_per_dof']:.4f}, "
+                          f"scale={overlay_result['fit_result']['scale_factor']:.6f}", "info")
+
         else:
             logger.log("Overlay failed", "error")
 
-def plot_theory_with_rle(files, cuts, locations, signs, jobs=1, rle_calib_dir="RLE/common", 
-                        mom_range=(95, 110), binwidth=0.1, output_file=None):
-    """
-    Plot reconstructed momentum data overlaid with theory convolved with RLE.
-    
-    Creates a theory spectrum from CeLL, loads resolution and loss distributions from
-    RLE calibration, convolves them, and overlays on reco data histogram.
-    
-    Args:
-        files: List of file list paths (.txt files)
-        cuts: List of cut switches for each file
-        locations: List of data locations (e.g., 'disk')
-        signs: List of particle signs (e.g., 'minus', 'plus')
-        jobs: Number of parallel jobs (default: 1)
-        rle_calib_dir (str): Path to RLE calibration output directory
-        mom_range (tuple): (min, max) momentum range for plotting
-        binwidth (float): Bin width for theory spectrum
-        output_file (str): Optional path to save plot
+    if proctype == "eff": # flat eff
+        rle = RLE_v2()
         
-    Returns:
-        fig, ax: Matplotlib figure and axes objects
-    """
-    logger = Logger(print_prefix="[plot_theory_with_rle]", verbosity=1)
-    
-    try:
-        # Extract reconstructed momentum from files using standard pipeline
-        recomom = []
-        for i, fil in enumerate(files):
-            ana_processor = AnaProcessor(fil, jobs, signs[i], cuts[i], locations[i], "ensemble")
-            results = ana_processor.execute()
-            combine_result = results["combined_data"]
-            
-            selector = Select()
-            
-            # select only track front to fit to
-            trk_front = selector.select_surface(combine_result['trkfit'], surface_name="TT_Front")
-            
-            # did the track intersect the ST?
-            has_st = selector.has_ST(combine_result['trkfit'])
-            
-            # combined mask
-            trkfit_ent = ak.mask(combine_result['trkfit']["trksegs"], trk_front)
-            
-            # make vector mag branch
-            vector = Vector()
-            mom_mag = vector.get_mag(trkfit_ent, 'mom')
-            recomom.append(mom_mag)
-        
-        # Flatten reco data if list of arrays
-        if isinstance(recomom, list):
-            reco_flat = ak.flatten(ak.concatenate(recomom), axis=None)
-        else:
-            reco_flat = ak.flatten(recomom, axis=None)
-        reco_np = np.array(reco_flat)
-        logger.log(f"Loaded {len(reco_np)} reco events", "info")
-        
-        # Create theory spectrum
-        logger.log("Creating theory spectrum...", "info")
-        theory = TheorySpectrum(mom_range=mom_range, binwidth=binwidth, verbosity=1)
-        theory_pdf = theory.get_pdf()
-        
-        # Create observable space for momentum (theory will be on this)
-        obs_mom = zfit.Space('mom', limits=mom_range)
-        
-        # Load RLE calibration data
-        logger.log("Loading RLE calibration...", "info")
-        
-        # Try to load skimmed data to get res and loss distributions
-        skimmed_path = f"{rle_calib_dir}/skimmed_flat_mom_MDC2025an.pkl"
-        try:
-            with open(skimmed_path, 'rb') as f:
-                skimmed_data = pkl.load(f)
-            logger.log(f"Loaded skimmed data from {skimmed_path}", "debug")
-            
-            # Extract resolution and loss from entrance plane
-            # IMPORTANT: These are NOT Gaussian! Resolution is GCB, Loss is truncated Landau
-            res_data = skimmed_data['entrance']['reco'] - skimmed_data['entrance']['mc']
-            loss_data = skimmed_data['entrance']['mc'] - skimmed_data['entrance']['gen']
-            
-            logger.log(f"Resolution distribution: {len(res_data)} events, mean={np.mean(res_data):.4f}, std={np.std(res_data):.4f}", "debug")
-            logger.log(f"Loss distribution: {len(loss_data)} events, mean={np.mean(loss_data):.4f}, std={np.std(loss_data):.4f}", "debug")
-            
-            # Create histogram PDFs from actual distributions to preserve non-Gaussian shapes
-            # CRITICAL: Create histograms on the ACTUAL observable bounds we'll use for convolution!
-            logger.log("Creating histogram kernel PDFs from actual res/loss distributions...", "info")
-            
-            # Resolution kernel: trim to tighter percentile range to exclude tail
-            # Use 10th-90th percentile instead of 1st-99th to focus on core distribution
-            res_trimmed = res_data[(res_data > np.percentile(res_data, 10)) & 
-                                  (res_data < np.percentile(res_data, 90))]
-            
-            # Use ±1.5σ bounds, symmetric around mean
-            res_mean = np.mean(res_trimmed)
-            res_std = np.std(res_trimmed)
-            res_min_physical = max(res_mean - 1.5*res_std, -5.0)   # Cap at -5 MeV
-            res_max_physical = min(res_mean + 1.5*res_std, 5.0)    # Cap at +5 MeV
-            res_trimmed = res_trimmed[(res_trimmed >= res_min_physical) & 
-                                      (res_trimmed <= res_max_physical)]
-            
-            res_nbins = 100
-            res_counts, res_edges = np.histogram(res_trimmed, bins=res_nbins, 
-                                                  range=(res_min_physical, res_max_physical))
-            res_counts = res_counts / np.sum(res_counts)  # Normalize
-            
-            # Create histogram PDF for resolution on ACTUAL kernel observable space [-5, 5]
-            from helper import make_HistogramPDF
-            obs_res_kernel = zfit.Space('x', limits=(res_min_physical, res_max_physical))
-            ResHistPDF = make_HistogramPDF(res_counts, res_edges)
-            res_pdf = ResHistPDF(obs=obs_res_kernel)  # On [-5, 5] kernel space!
-            
-            logger.log(f"Resolution kernel: histogram from {len(res_trimmed)} events, range=[{res_min_physical:.4f}, {res_max_physical:.4f}]", "info")
-            
-            # Loss kernel: trim to tighter percentile range to exclude tail
-            # Use 10th-90th percentile instead of 1st-99th to focus on core distribution
-            loss_trimmed = loss_data[(loss_data > np.percentile(loss_data, 10)) & 
-                                     (loss_data < np.percentile(loss_data, 90))]
-            
-            # Calculate loss mean and use tighter bounds around it (1.5σ)
-            loss_mean = np.mean(loss_trimmed)
-            loss_std = np.std(loss_trimmed)
-            # Use ±1.5σ bounds for tighter kernel, symmetric around actual mean
-            loss_min_physical = max(loss_mean - 1.5*loss_std, -15.0)   # Cap at -15 MeV
-            loss_max_physical = min(loss_mean + 1.5*loss_std, 1.0)     # Cap at +1 MeV
-            loss_trimmed = loss_trimmed[(loss_trimmed >= loss_min_physical) & 
-                                        (loss_trimmed <= loss_max_physical)]
-            
-            loss_nbins = 100
-            loss_counts, loss_edges = np.histogram(loss_trimmed, bins=loss_nbins,
-                                                    range=(loss_min_physical, loss_max_physical))
-            loss_counts = loss_counts / np.sum(loss_counts)  # Normalize
-            
-            # Create histogram PDF for loss on bounds centered at actual mean
-            obs_loss_kernel = zfit.Space('x', limits=(loss_min_physical, loss_max_physical))
-            LossHistPDF = make_HistogramPDF(loss_counts, loss_edges)
-            loss_pdf = LossHistPDF(obs=obs_loss_kernel)  # Centered on actual distribution!
-            
-            logger.log(f"Loss kernel: histogram from {len(loss_trimmed)} events, range=[{loss_min_physical:.4f}, {loss_max_physical:.4f}]", "info")
-            
-        except FileNotFoundError:
-            logger.log(f"Warning: Could not find {skimmed_path}", "warn")
-            logger.log("Using default Gaussian PDFs as fallback", "warn")
-            
-            # Fallback: Use simple Gaussians
-            res_pdf = zfit.pdf.Gauss(
-                mu=zfit.Parameter('res_mu', 0.0, -0.5, 0.5),
-                sigma=zfit.Parameter('res_sigma', 0.3, 0.01, 1.0),
-                obs=obs_mom
-            )
-            loss_pdf = zfit.pdf.Gauss(
-                mu=zfit.Parameter('loss_mu', -0.5, -2.0, 0.0),
-                sigma=zfit.Parameter('loss_sigma', 0.5, 0.01, 2.0),
-                obs=obs_mom
-            )
-        
-        # Create comparison and plot
-        comparison = Compare()
-        title = "Reco Momentum with Theory ⊗ RLE Convolution"
-        label = "CeLL (Leading Log) ⊗ RLE"
-        
-        if output_file is None:
-            output_file = f"{rle_calib_dir}/theory_convolved_reco.png"
-        
-        fig, ax = comparison.convolve_with_rle(
-            reco_data=reco_np,
-            theory_pdf=theory_pdf,
-            res_pdf=res_pdf,
-            loss_pdf=loss_pdf,
-            mom_range=mom_range,
-            nbins=100,
-            label=label,
-            plot_title=title,
-            output_file=output_file
-        )
-        
-        logger.log(f"Theory convolution plot saved to {output_file}", "success")
-        return fig, ax
-        
-    except Exception as e:
-        logger.log(f"Error in theory convolution: {e}", "error")
-        import traceback
-        traceback.print_exc()
-        return None, None
+        rle.fit_momentum(originmom, 90,120,opt="poly", label = r"$p_{gen}$ [MeV/c]",nbins=50)
+        rle.fit_momentum(originmom, 101,109,opt="linear", label = r"$p_{gen}$ [MeV/c]",nbins=20)
 
+    if proctype == "CE": #endpoint
+        rle = RLE_v2()
+        #rle.fit_momentum(resolutions_origin, -5,5,opt="dscb", label = r"$(p_{reco} - p_{gen})$ [MeV/c]")
 
-def apply_ce_rle_convolution(calibration_path="RLE/common/calibration.json", 
-                             mom_range=(95, 110), binwidth=0.1, output_plot=None):
-    """
-    Apply RLE convolution to CeLL theory spectrum
-    
-    Uses the calibrated Chebyshev efficiency, GCB resolution, and Landau loss
-    to convolve the CeLL leading-log spectrum.
-    
-    Args:
-        calibration_path (str): Path to calibration.json from RLE
-        mom_range (tuple): (min, max) momentum range
-        binwidth (float): Bin width for momentum grid
-        output_plot (str): Optional path to save convolution steps plot
-        
-    Returns:
-        dict: {
-            'x_grid': momentum grid,
-            'theory': CeLL spectrum,
-            'after_loss': after loss convolution,
-            'after_resolution': after resolution convolution,
-            'final': after efficiency scaling,
-            'efficiency': efficiency values
-        }
-    """
-    logger = Logger(print_prefix="[apply_ce_rle_convolution]", verbosity=1)
-    
-    try:
-        logger.log("Creating CeLL theory spectrum...", "info")
-        theory = TheorySpectrum(mom_range=mom_range, binwidth=binwidth, verbosity=0)
-        
-        # Create momentum grid
-        x_grid = np.arange(mom_range[0], mom_range[1], binwidth)
-        
-        # Get theory PDF and evaluate on grid
-        theory_pdf = theory.get_pdf()
-        obs_mom = zfit.Space('p', limits=mom_range)
-        theory_vals = zfit.run(theory_pdf.pdf(x_grid.reshape(-1, 1))).flatten()
-        
-        logger.log(f"Theory spectrum: {len(x_grid)} points from {mom_range[0]} to {mom_range[1]} MeV", "info")
-        logger.log(f"Loading calibration from {calibration_path}...", "info")
-        
-        # Apply full RLE convolution
-        result = apply_rle_convolution(x_grid, theory_vals, calibration_path)
-        
-        logger.log("RLE convolution complete:", "info")
-        logger.log(f"  Theory integral: {np.trapz(result['theory'], x_grid):.4f}", "info")
-        logger.log(f"  After loss integral: {np.trapz(result['after_loss'], x_grid):.4f}", "info")
-        logger.log(f"  After resolution integral: {np.trapz(result['after_resolution'], x_grid):.4f}", "info")
-        logger.log(f"  Final (× efficiency) integral: {np.trapz(result['final'], x_grid):.4f}", "info")
-        logger.log(f"  Efficiency range: [{np.min(result['efficiency']):.3f}, {np.max(result['efficiency']):.3f}]", "info")
-        
-        # Optionally create plot
-        if output_plot:
-            logger.log(f"Creating convolution plot at {output_plot}...", "info")
-            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-            
-            # Step 1: Theory
-            axes[0, 0].plot(result['x_grid'], result['theory'], 'b-', linewidth=2)
-            axes[0, 0].set_ylabel('PDF')
-            axes[0, 0].set_title('Step 1: CeLL Theory Spectrum')
-            axes[0, 0].grid(True, alpha=0.3)
-            
-            # Step 2: After loss
-            axes[0, 1].plot(result['x_grid'], result['after_loss'], 'g-', linewidth=2)
-            axes[0, 1].set_ylabel('PDF')
-            axes[0, 1].set_title('Step 2: Theory ⊗ Landau Loss')
-            axes[0, 1].grid(True, alpha=0.3)
-            
-            # Step 3: After resolution
-            axes[1, 0].plot(result['x_grid'], result['after_resolution'], 'r-', linewidth=2)
-            axes[1, 0].set_ylabel('PDF')
-            axes[1, 0].set_xlabel('Momentum [MeV]')
-            axes[1, 0].set_title('Step 3: (Theory ⊗ Loss) ⊗ GCB Resolution')
-            axes[1, 0].grid(True, alpha=0.3)
-            
-            # Step 4: Final with efficiency
-            ax_final = axes[1, 1]
-            ax_final.plot(result['x_grid'], result['final'], 'purple', linewidth=2, label='Final spectrum')
-            ax_final_eff = ax_final.twinx()
-            ax_final_eff.plot(result['x_grid'], result['efficiency'], 'orange', linewidth=1.5, linestyle='--', label='Efficiency')
-            ax_final.set_ylabel('Final PDF (purple)', color='purple')
-            ax_final_eff.set_ylabel('Efficiency (orange)', color='orange')
-            ax_final.set_xlabel('Momentum [MeV]')
-            ax_final.set_title('Step 4: Apply Chebyshev Efficiency')
-            ax_final.grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            plt.savefig(output_plot, dpi=150, bbox_inches='tight')
-            logger.log(f"Plot saved to {output_plot}", "success")
-            plt.close()
-        
-        return result
-        
-    except Exception as e:
-        logger.log(f"Error in RLE convolution: {e}", "error")
-        import traceback
-        traceback.print_exc()
-        return None
+        convolved = rle.convolve_theory_with_resolution(theory_pdf=None, momentum_range=(90, 110), 
+                                        proctype='CE', theory_params=None,
+                                        data_list=recomom,
+                                        calibration_path='RLE/common/calibration.json',
+                                        floating_params=False, plot_label='convolution')
+    if proctype == "DIO":
+        rle = RLE_v2()
+        #rle.fit_momentum(resolutions_origin, -5,5,opt="dscb", label = r"$(p_{reco} - p_{gen})$ [MeV/c]")
 
+        #convolved = rle.convolve_theory_with_resolution(theory_pdf=None, momentum_range=(95, 115), 
+        #                                proctype='DIO', theory_params=None,
+        #                                data_list=recomom,
+        #                                calibration_path='RLE/common/calibration.json',
+        #                                floating_params=False, plot_label='convolution')
 
-def overlay_convolved_theory_on_reco(reco_momenta, calibration_path="RLE/common/calibration.json",
-                                     mom_range=(95, 110), binwidth=0.1, output_plot=None):
-    """
-    Overlay normalized convolved theory spectrum on reconstructed data
-    
-    Creates histogram of reco data, applies RLE convolution to theory,
-    normalizes theory to number of events, and plots both overlaid.
-    
-    Args:
-        reco_momenta (array): Reconstructed momentum values from data
-        calibration_path (str): Path to calibration.json from RLE
-        mom_range (tuple): (min, max) momentum range
-        binwidth (float): Bin width for momentum grid and histogram
-        output_plot (str): Path to save overlay plot
-        
-    Returns:
-        dict: {
-            'reco_momenta': filtered reco data,
-            'convolution_result': result from apply_ce_rle_convolution,
-            'n_events': number of events in reco
-        }
-    """
-    logger = Logger(print_prefix="[overlay_convolved_theory_on_reco]", verbosity=1)
-    
-    try:
-        # Filter reco data to mom_range
-        reco_filtered = reco_momenta[(reco_momenta >= mom_range[0]) & (reco_momenta <= mom_range[1])]
-        n_events = len(reco_filtered)
-        logger.log(f"Filtered reco data: {n_events} events in [{mom_range[0]}, {mom_range[1]}] MeV", "info")
-        
-        # Get convolved theory
-        logger.log("Generating convolved theory spectrum...", "info")
-        conv_result = apply_ce_rle_convolution(calibration_path=calibration_path,
-                                                mom_range=mom_range, binwidth=binwidth,
-                                                output_plot=None)  # Don't save conv plot here
-        
-        if conv_result is None:
-            logger.log("Failed to generate convolution result", "error")
-            return None
-        
-        x_grid = conv_result['x_grid']
-        after_resolution = conv_result['after_resolution']  # Use spectrum BEFORE efficiency
-        final_spectrum = conv_result['final']  # Keep for reference
-        
-        # Normalize spectrum BEFORE efficiency is applied
-        # The efficiency will then modulate the final shape without inflating values
-        integral_before_eff = np.trapz(after_resolution, x_grid)
-        if integral_before_eff > 0:
-            normalization_factor = n_events / integral_before_eff
-            theory_normalized = after_resolution * normalization_factor
-        else:
-            logger.log("Warning: after-resolution spectrum integral is 0 or negative", "warning")
-            theory_normalized = after_resolution
-            normalization_factor = 0
-        
-        logger.log(f"=== NORMALIZATION DEBUG ===", "info")
-        logger.log(f"Number of filtered reco events: {n_events}", "info")
-        logger.log(f"After-resolution spectrum integral (before efficiency): {integral_before_eff:.8f}", "info")
-        logger.log(f"Normalization factor (n_events / after_resolution_integral): {normalization_factor:.8f}", "info")
-        logger.log(f"Theory max value after normalization: {np.max(theory_normalized):.6f}", "info")
-        logger.log(f"Theory min value after normalization: {np.min(theory_normalized):.6f}", "info")
-        logger.log(f"Theory mean value after normalization: {np.mean(theory_normalized):.6f}", "info")
-        logger.log(f"Integral of normalized theory: {np.trapz(theory_normalized, x_grid):.8f} (should ≈ {n_events})", "info")
-        logger.log(f"Reco histogram integral (sum of counts): {np.sum(np.histogram(reco_filtered, bins=int((mom_range[1] - mom_range[0]) / binwidth), range=mom_range)[0])}", "info")
-        logger.log(f"Efficiency range: [{np.min(conv_result['efficiency']):.3f}, {np.max(conv_result['efficiency']):.3f}]", "info")
-        logger.log(f"===========================", "info")
-        
-        # Create overlay plot
-        if output_plot:
-            logger.log(f"Creating overlay plot at {output_plot}...", "info")
-            fig, ax = plt.subplots(figsize=(11, 8))
-            
-            # Reco histogram
-            n_bins = int((mom_range[1] - mom_range[0]) / binwidth)
-            counts, edges, patches = ax.hist(reco_filtered, bins=n_bins, range=mom_range,
-                                              label=f'Reco Data ({n_events} events)',
-                                              alpha=0.7, color='orange', edgecolor='none')
-            
-            # Convolved theory overlay (with efficiency modulation)
-            # Multiply by binwidth to convert from density to bin counts to match histogram
-            theory_with_eff = (theory_normalized * conv_result['efficiency']) * binwidth
-            ax.plot(x_grid, theory_with_eff, 'r-', linewidth=2.5,
-                   label='CeLL Theory ⊗ RLE (Landau+GCB) × Efficiency')
-            
-            # Also show efficiency as secondary axis
-            ax2 = ax.twinx()
-            ax2.plot(x_grid, conv_result['efficiency'], 'navy', linewidth=1.5, linestyle='--',
-                    label='Efficiency (Chebyshev)', alpha=0.7)
-            ax2.set_ylabel('Efficiency', color='navy', fontsize=13)
-            ax2.tick_params(axis='y', labelcolor='navy', labelsize=12)
-            
-            ax.set_xlabel('Reconstructed Momentum [MeV]', fontsize=14)
-            ax.set_ylabel('Events / {:.2f} MeV'.format(binwidth), fontsize=14)
-            ax.set_title('Reconstructed Spectrum vs RLE-Convolved Theory', fontsize=14, fontweight='bold')
-            ax.tick_params(axis='both', which='major', labelsize=12)
-            ax.tick_params(axis='both', which='minor', labelsize=10)
-            ax.minorticks_on()
-            ax.grid(False)
-            ax.legend(loc='upper right', fontsize=12)
-            
-            plt.tight_layout()
-            plt.savefig(output_plot, dpi=150, bbox_inches='tight')
-            logger.log(f"Overlay plot saved to {output_plot}", "success")
-            plt.close()
-        
-        return {
-            'reco_momenta': reco_filtered,
-            'convolution_result': conv_result,
-            'n_events': n_events,
-            'theory_normalized': theory_normalized
-        }
-        
-    except Exception as e:
-        logger.log(f"Error in overlay: {e}", "error")
-        import traceback
-        traceback.print_exc()
-        return None
+        convolved = rle.fit_theory_with_resolution_with_fit(theory_pdf=None, momentum_range=(95, 115), 
+                                   proctype='DIO', data_list=recomom,
+                                   calibration_path='RLE/common/calibration.json',
+                                   error_path='RLE/common/calibration_errors.json',
+                                   plot_label='fit_result')
+    if proctype == "CELL": 
+        rle = RLE_v2()
+        rle.fit_momentum(recomom, 85,115,opt="dscb", label = r"$p_{reco} $ [MeV/c]")
+
 
 
 def WriteFittedData(data, min_v, max_v):
@@ -1346,34 +1073,27 @@ def run_cut_optimization(file_list_path, sign="minus", cuts=None, locations='dis
                 True,  # 1 has_downstream
                 True, # 2 has trk front
                 False,  # 3 good_trkqpid
-                False,  # 4 good_trkqual
-                False, # 5 within_t0
-                True,  # 6 within_t0err
-                True,  # 7 has_hits
-                False, # 8 within_lhr_maxl
-                False, # 9 within_d0
-                False, # 10 within_pitch_angle
-                False,  #11 has_st
-                False,  #12 no_opa
-                False,  #13 no_crv_veto
-                False,  #14 no_crv_quality
-                False,  #15 no_crv_timewindow
-                False,  #16 pz/pt
-                True,  #17 triggers
-                False,  #18 within_mom_time
-                False, #19 early time
-                False #20 reflected
+                True,  # 4 good_trkqual
+                True,  # 5 within_t0err
+                True,  # 6 has_hits
+                False, # 7 within_lhr_maxl
+                False, # 8 within_d0
+                False, # 9 within_pitch_angle
+                False,  #10 has_st
+                False,  #11 no_opa
+                False,  #12 no_crv_veto
+                False,  #13 no_crv_quality
+                False,  #14 no_crv_timewindow
+                True,  #15 pz/pt
+                True,  #16 triggers
+                False,  #17 in_mom_range
+                False, #18 within_t0_early
+                False, #19 no_reflected
+                False, #20 within_t0
+                False  #21 signal_region
                 ]
         else:
-            cuts = [True, True, True, True, True, False, True, True, False, False, False, True, True, True, True, True, True, False, False, False, False]
-    
-    # Step 1: Load and process data
-    logger.log(f"\nStep 1: Loading data from {file_list_path}", "info")
-    ana_processor = AnaProcessor(file_list_path, jobs=jobs, sign=sign, cuts=cuts, location=locations)
-    results = ana_processor.execute()
-    combine_result = results["combined_data"]
-    
-    logger.log(f"Data loaded successfully", "info")
+            cuts = [True, True, True, True, True, True, True, False, False, False, False, False, False, False, False, False, True, False, False, False, False, False]
     
     # Step 2: Extract variables for optimization
     logger.log(f"\nStep 2: Extracting variables for optimization", "info")
@@ -1475,6 +1195,222 @@ def run_cut_optimization(file_list_path, sign="minus", cuts=None, locations='dis
     
     return opt_results
 
+def run_multi_background_optimization(args):
+    """Run simple TrkPID threshold scan: signal efficiency vs background rejection.
+    
+    Loads signal (CE) and background (Cosmics) samples, scans TrkPID cut,
+    and plots signal efficiency vs background rejection curve.
+    
+    Args:
+        args: Command line arguments with fields:
+            - jobs: Number of parallel jobs
+            - sign: Particle sign (minus/plus)
+            - loc: Data location (disk/local)
+    """
+    from optimize_cuts import scan_thresholds
+    
+    # Pre-selection cuts to apply before optimization
+    cuts = [
+        True,  # 0 is_reco_electron
+        True,  # 1 has_downstream
+        True,  # 2 has trk front
+        False,  # 3 good_trkqpid
+        True,  # 4 good_trkqual
+        True,  # 5 within_t0err
+        True,  # 6 has_hits
+        False,  # 7 within_lhr_maxl
+        False,  # 8 within_d0
+        False,  # 9 within_pitch_angle
+        True,  # 10 has_st
+        True,  # 11 no_opa
+        True,   # 12 no_crv_veto
+        True,   # 13 no_crv_quality
+        True,   # 14 no_crv_timewindow
+        True,   # 15 pz/pt
+        True,   # 16 triggers
+        False,  # 17 in_mom_range
+        False,  # 18 within_t0_early
+        False,  # 19 no_reflected
+        False,  # 20 within_t0
+        False   # 21 signal_region
+    ]
+    
+    print("\n" + "=" * 80)
+    print("TrkPID THRESHOLD SCAN: Signal vs Cosmics")
+    print("=" * 80)
+    
+    # Load signal sample
+    print("\nLoading signal (CeMLL)...", end="", flush=True)
+    processor_sig = AnaProcessor(
+        file_list_path="file_lists_full/CeMLL_MDC2025an_best_nomix.txt",
+        jobs=args.jobs,
+        sign=args.sign,
+        cuts=cuts,
+        location=args.loc,
+        proctype="ensemble"
+    )
+    results_sig = processor_sig.execute()
+    sig_data = results_sig["combined_data"]
+    print(f" {len(sig_data)} events")
+    
+    # Load background sample (Cosmics)
+    print("Loading background (Cosmics)...", end="", flush=True)
+    processor_bkg = AnaProcessor(
+        file_list_path="file_lists_full/Cosimcs_MDC2025an_nomix.txt",
+        jobs=args.jobs,
+        sign=args.sign,
+        cuts=cuts,
+        location=args.loc,
+        proctype="ensemble"
+    )
+    results_bkg = processor_bkg.execute()
+    bkg_data = results_bkg["combined_data"]
+    print(f" {len(bkg_data)} events")
+    
+    # Extract TrkPID values
+    print("\nExtracting TrkPID values...")
+    sig_trkpid = ak.flatten(sig_data['trk']['trkpid.result'], axis=None)
+    bkg_trkpid = ak.flatten(bkg_data['trk']['trkpid.result'], axis=None)
+    
+    sig_trkpid = np.asarray(sig_trkpid)
+    bkg_trkpid = np.asarray(bkg_trkpid)
+    
+    print(f"  Signal: {len(sig_trkpid)} tracks")
+    print(f"  Cosmics: {len(bkg_trkpid)} tracks")
+    
+    # Print TrkPID range
+    sig_min, sig_max = np.nanmin(sig_trkpid), np.nanmax(sig_trkpid)
+    bkg_min, bkg_max = np.nanmin(bkg_trkpid), np.nanmax(bkg_trkpid)
+    overall_min = min(sig_min, bkg_min)
+    overall_max = max(sig_max, bkg_max)
+    print(f"\nTrkPID range:")
+    print(f"  Signal: [{sig_min:.6f}, {sig_max:.6f}]")
+    print(f"  Cosmics: [{bkg_min:.6f}, {bkg_max:.6f}]")
+    print(f"  Overall: [{overall_min:.6f}, {overall_max:.6f}]")
+    
+    # Scan thresholds using existing function
+    print(f"\nScanning TrkPID thresholds ({500} steps)...")
+    rows = scan_thresholds(sig_trkpid, bkg_trkpid, direction='greater', n_steps=500, metric='youden')
+    
+    # Create output directory
+    import os
+    os.makedirs("cut_optimization", exist_ok=True)
+    
+    # Sort rows by threshold for cleaner plots
+    rows_sorted = sorted(rows, key=lambda r: r['threshold'])
+    
+    # Calculate best threshold once to ensure consistency across all plots
+    best_youden_idx = np.argmax([r['metric'] for r in rows_sorted])
+    best_row = rows_sorted[best_youden_idx]
+    best_threshold = best_row['threshold']
+    best_tpr_val = best_row['tpr']
+    best_bkg_rej_val = best_row['bkg_rej']
+    best_fpr_val = 1.0 - best_bkg_rej_val
+    
+    # Plot: TMVA-style plot with TrkPID on x-axis and two y-axes
+    fig, ax1 = plt.subplots(figsize=(11, 8))
+    
+    thresholds = [r['threshold'] for r in rows_sorted]
+    sig_effs = [r['tpr'] for r in rows_sorted]
+    bkg_rejs = [r['bkg_rej'] for r in rows_sorted]
+    
+    # Plot signal efficiency on left y-axis
+    color1 = 'steelblue'
+    ax1.set_xlabel('TrkPID Threshold', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('Signal Efficiency', fontsize=12, fontweight='bold', color=color1)
+    line1 = ax1.plot(thresholds, sig_effs, color=color1, linewidth=2.5, marker='o', markersize=4, label='Signal Efficiency')
+    ax1.tick_params(axis='y', labelcolor=color1)
+    ax1.set_ylim([0, 1.05])
+    ax1.set_xlim([0, max(thresholds)])
+    
+    # Create right y-axis for background rejection
+    ax2 = ax1.twinx()
+    color2 = 'darkgreen'
+    ax2.set_ylabel('Background Rejection', fontsize=12, fontweight='bold', color=color2)
+    line2 = ax2.plot(thresholds, bkg_rejs, color=color2, linewidth=2.5, marker='s', markersize=4, label='Background Rejection')
+    ax2.tick_params(axis='y', labelcolor=color2)
+    ax2.set_ylim([0, 1.05])
+    
+    # Title
+    ax1.set_title('TrkPID Cut Optimization (TMVA-style)', fontsize=13, fontweight='bold')
+    ax1.grid(True, alpha=0.3, axis='x')
+    
+    # Add dashed line at optimal threshold
+    ax1.axvline(best_threshold, color='red', linestyle='--', linewidth=2, alpha=0.7, label=f'Optimal (Youden): {best_threshold:.4f}')
+    
+    # Combined legend
+    lines = line1 + line2
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, fontsize=11, loc='center left')
+    
+    plt.tight_layout()
+    out_path = "cut_optimization/trkpid_scan.png"
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved plot to: {out_path}")
+    
+    # Plot: ROC Curve (True Positive Rate vs False Positive Rate)
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    # Create FPR/TPR pairs and sort by FPR for proper ROC curve
+    roc_points = [(1.0 - r['bkg_rej'], r['tpr']) for r in rows_sorted]
+    roc_points_sorted = sorted(roc_points, key=lambda x: x[0])  # Sort by FPR
+    
+    fpr_sorted = [p[0] for p in roc_points_sorted]
+    tpr_sorted = [p[1] for p in roc_points_sorted]
+    
+    # Plot ROC curve
+    ax.plot(fpr_sorted, tpr_sorted, color='darkblue', linewidth=2.5, marker='o', markersize=4, label='TrkPID ROC')
+    
+    # Add diagonal reference line (random classifier)
+    ax.plot([0, 1], [0, 1], color='gray', linestyle='--', linewidth=1.5, alpha=0.7, label='Random Classifier')
+    
+    # Mark optimal point using pre-calculated values
+    ax.plot(best_fpr_val, best_tpr_val, marker='*', markersize=20, color='red', 
+            label=f'Optimal (Youden): FPR={best_fpr_val:.4f}, TPR={best_tpr_val:.4f}')
+    
+    # Debug: print red star position
+    print(f"\n[ROC DEBUG] Red star position:")
+    print(f"  Threshold: {best_threshold:.6f}")
+    print(f"  FPR (1-bkg_rej): {best_fpr_val:.6f}")
+    print(f"  TPR (sig_eff): {best_tpr_val:.6f}")
+    
+    # Labels and formatting
+    ax.set_xlabel('False Positive Rate (1 - Background Rejection)', fontsize=12, fontweight='bold')
+    ax.set_ylabel('True Positive Rate (Signal Efficiency)', fontsize=12, fontweight='bold')
+    ax.set_title('TrkPID ROC Curve: Signal vs Cosmics', fontsize=13, fontweight='bold')
+    ax.set_xlim([0, 1.0])
+    ax.set_ylim([0, 1.05])
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=11, loc='lower right')
+    
+    plt.tight_layout()
+    roc_path = "cut_optimization/trkpid_roc.png"
+    plt.savefig(roc_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved ROC curve to: {roc_path}")
+    
+    # Save CSV
+    csv_path = "cut_optimization/trkpid_scan.csv"
+    with open(csv_path, 'w') as f:
+        f.write("threshold,signal_efficiency,background_rejection\n")
+        for r in rows:
+            f.write(f"{r['threshold']:.6f},{r['tpr']:.6f},{r['bkg_rej']:.6f}\n")
+    print(f"Saved results to: {csv_path}")
+    
+    # Print summary
+    print("\n" + "=" * 80)
+    print("SCAN SUMMARY")
+    print("=" * 80)
+    print(f"Threshold range: {min(thresholds):.4f} to {max(thresholds):.4f}")
+    print(f"Best Youden Index threshold: {best_threshold:.6f}")
+    print(f"  Signal Efficiency (TPR): {best_tpr_val:.6f}")
+    print(f"  Background Rejection: {best_bkg_rej_val:.6f}")
+    print(f"  FPR (1-bkg_rej): {best_fpr_val:.6f}")
+    print("=" * 80 + "\n")
+    
+    return rows
+
 
 # Create an instance of our custom processor
 def  main(args):
@@ -1482,7 +1418,31 @@ def  main(args):
   """
   print("Running main function")
   new = []
-  
+  old= [
+      True,  # 0 is_reco_electron
+      True,  # 1 has_downstream
+      True, # 2 has trk front
+      True,  # 3 good_trkqpid
+      True,  # 4 good_trkqual
+      True,  # 5 within_t0err
+      True,  # 6 has_hits
+      True, # 7 within_lhr_maxl
+      True, # 8 within_d0
+      True, # 9 within_pitch_angle
+      False,  #10 has_st
+      False,  #11 no_opa
+      True,  #12 no_crv_veto
+      True,  #13 no_crv_quality
+      True,  #14 no_crv_timewindow
+      True,  #15 pz/pt
+      True,  #16 triggers
+      True,  #17 in_mom_range
+      False, #18 within_t0_early
+      False, #19 no_reflected
+      True,  #20 within_t0
+      True, # 21 signal region cut
+      True # or trigger select
+  ]
   if args.sign == "minus":
     new= [
       True,  # 0 is_reco_electron
@@ -1490,22 +1450,24 @@ def  main(args):
       True, # 2 has trk front
       True,  # 3 good_trkqpid
       True,  # 4 good_trkqual
-      False, # 5 within_t0
-      True,  # 6 within_t0err
-      True,  # 7 has_hits
-      False, # 8 within_lhr_maxl
-      False, # 9 within_d0
-      False, # 10 within_pitch_angle
-      True,  #11 has_st
-      True,  #12 no_opa
-      True,  #13 no_crv_veto
-      True,  #14 no_crv_quality
-      True,  #15 no_crv_timewindow
-      True,  #16 pz/pt
-      True,  #17 triggers
-      False,  #18 within_mom_time
-      False, #19 early time
-      False #20 reflected
+      True,  # 5 within_t0err
+      True,  # 6 has_hits
+      False, # 7 within_lhr_maxl
+      False, # 8 within_d0
+      False, # 9 within_pitch_angle
+      True,  #10 has_st
+      True,  #11 no_opa
+      True,  #12 no_crv_veto
+      True,  #13 no_crv_quality
+      True,  #14 no_crv_timewindow
+      True,  #15 pz/pt
+      True,  #16 triggers
+      False,  #17 in_mom_range
+      False, #18 within_t0_early
+      True, #19 no_reflected
+      False,  #20 within_t0
+      False, # 21 signal region cut
+      False # or trigger select
     ]
   if args.sign == "plus":
     new= [
@@ -1513,26 +1475,52 @@ def  main(args):
       True,  # 1 has_downstream
       True, # 2 has trk front
       True,  # 3 good_trkqpid
-      False,  # 4 good_trkqual
-      False, # 5 within_t0
-      True,  # 6 within_t0err
-      True,  # 7 has_hits
-      False, # 8 within_lhr_maxl
-      False, # 9 within_d0
-      False, # 10 within_pitch_angle
-      True,  #11 has_st
-      True,  #12 no_opa
-      True,  #13 no_crv_veto
-      True,  #14 no_crv_quality
-      True,  #15 no_crv_timewindow
-      True,  #16 pz/pt
-      True,  #17 triggers
-      False,  #18 within_mom_time
-      False, #19 early time
-      False #20 reflected
+      True,  # 4 good_trkqual
+      True,  # 5 within_t0err
+      True,  # 6 has_hits
+      False, # 7 within_lhr_maxl
+      False, # 8 within_d0
+      False, # 9 within_pitch_angle
+      True,  #10 has_st
+      True,  #11 no_opa
+      True,  #12 no_crv_veto
+      True,  #13 no_crv_quality
+      True,  #14 no_crv_timewindow
+      True,  #15 pz/pt
+      True,  #16 triggers
+      False,  #17 in_mom_range
+      False, #18 within_t0_early
+      False, #19 no_reflected
+      True,  #20 within_t0
+      True # or trigger select
     ]
 
   print("starting main function with cuts:", new)
+  if args.proctype == "optimize_cuts":
+    run_multi_background_optimization(args)
+    return
+
+  if args.proctype == "rpc":
+    files = ["file_lists_full/IntRPC_MDC2025an_nomix.txt","file_lists_full/IntRPC_MDC2025an_nomix.txt"]
+    signs = ["minus","plus"]
+    locations = [args.loc,args.loc]
+    columns = ["internal e-","internal e+"]
+    cuts = [new,new]
+    fit_dataset(files, cuts, locations, columns, signs, args.proctype)
+
+    print("Done plotting")
+    return
+
+  if args.proctype == "cosmics-compare":
+    files = ["file_lists/Cosimcs_MDC2025an_nomix.txt","file_lists/OffSpill_MDC2025an.txt"]
+    signs = [args.sign,args.sign]
+    locations = [args.loc,args.loc]
+    columns = ["OnSpill Cosmics","OffSpill Cosmics"]
+    cuts = [new,new]
+    fit_dataset(files, cuts, locations, columns, signs, args.proctype)
+
+    print("Done plotting")
+    return
 
   files = [args.file]
   signs = [args.sign]
@@ -1541,7 +1529,7 @@ def  main(args):
   cuts = [new]
   #compare_datasets(files, cuts, locations, columns, signs)
   fit_dataset(files, cuts, locations, columns, signs, args.proctype)
-  if args.proctype == "CE":
+  if args.proctype == "CELL":
     fig, ax = plot_theory_with_rle(
       files=files,
       cuts=cuts,

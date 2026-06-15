@@ -41,7 +41,7 @@ class Cosmics():
             mom_mag_skim = ak.drop_none(mom_mag_skim)
 
             # Define the observable space for the fit
-            obs_mom = zfit.Space('x', limits=(80,150))#
+            obs_mom = zfit.Space('x', limits=(97,110))#
             mom_np = ak.to_numpy(ak.flatten(mom_mag_skim, axis=None))
             mom_zfit = zfit.Data.from_numpy(array=mom_np, obs=obs_mom)
             
@@ -53,10 +53,10 @@ class Cosmics():
             # Create parameters for the coefficients
             c1 = zfit.Parameter("c1", 0.1, -1, 1)
             c2 = zfit.Parameter("c2", 0.1, -1, 1)
-            c3 = zfit.Parameter("c3", 0.1, -1, 1)
-            c4 = zfit.Parameter("c4", 0.1, -1, 1)
-            c5 = zfit.Parameter("c5", 0.1, -1, 1)
-            coeffs = [c1, c2, c3, c4, c5]
+            #c3 = zfit.Parameter("c3", 0.1, -1, 1)
+            #c4 = zfit.Parameter("c4", 0.1, -1, 1)
+            #c5 = zfit.Parameter("c5", 0.1, -1, 1)
+            coeffs = [c1, c2]#, c3, c4, c5]
 
             # Create a Chebyshev polynomial PDF
             poly_model = zfit.pdf.Chebyshev(obs=obs_mom, coeffs=coeffs, extended=N_Cosmic)
@@ -129,9 +129,9 @@ class Cosmics():
                 f"$N_{{Cosmic}} = {result.params[N_Cosmic]['value']:.0f} \\pm {hesse_errors[N_Cosmic]['error']:.2f}$\n"
                 f"$c_{{1}} = {result.params[c1]['value']:.3f} \\pm {hesse_errors[c1]['error']:.4f}$\n"
                 f"$c_{{2}} = {result.params[c2]['value']:.3f} \\pm {hesse_errors[c2]['error']:.4f}$\n"
-                f"$c_{{3}} = {result.params[c3]['value']:.3f} \\pm {hesse_errors[c3]['error']:.4f}$\n"
-                f"$c_{{4}} = {result.params[c4]['value']:.3f} \\pm {hesse_errors[c4]['error']:.4f}$\n"
-                f"$c_{{5}} = {result.params[c5]['value']:.3f} \\pm {hesse_errors[c5]['error']:.4f}$"
+                #f"$c_{{3}} = {result.params[c3]['value']:.3f} \\pm {hesse_errors[c3]['error']:.4f}$\n"
+                #f"$c_{{4}} = {result.params[c4]['value']:.3f} \\pm {hesse_errors[c4]['error']:.4f}$\n"
+                #f"$c_{{5}} = {result.params[c5]['value']:.3f} \\pm {hesse_errors[c5]['error']:.4f}$"
                 
             )
             
