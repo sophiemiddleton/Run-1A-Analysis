@@ -159,7 +159,7 @@ class AnaProcessor(Skeleton):
         import queue
         
         file_start = time.time()
-        timeout_seconds = 60  # 1 minute timeout per file - if file hangs, skip it
+        timeout_seconds = 270  # 1 minute timeout per file - if file hangs, skip it
         
         # Extract just the filename for cleaner logging
         just_filename = file_name.split('/')[-1] if '/' in file_name else file_name
@@ -524,19 +524,21 @@ def compare_datasets( files, cuts, locations, columns, signs):
       vector = Vector()
       mom_mag = vector.get_mag(trkfit_ent ,'mom')
       
-      # save reconstructed momentum magnitudes for this dataset to CSV
-      # write fitted-range data using WriteFittedData
-      try:
-        WriteFittedData(mom_mag, 95, 110)
-      except Exception as e:
-        print(f"WriteFittedData failed: {e}")
-
+      
       #mom_mag = ak.nan_to_none(mom_mag)
       #mom_mag = ak.drop_none(mom_mag)
 
       time = ak.nan_to_none(trkfit_ent['time'])
       time = ak.drop_none(time)
       
+      # save reconstructed momentum magnitudes for this dataset to CSV
+      # write fitted-range data using WriteFittedData
+      try:
+        WriteFittedData(mom_mag, time, 95, 110)
+      except Exception as e:
+        print(f"WriteFittedData failed: {e}")
+
+
       vector = Vector()
       mom_mag_mc = vector.get_mag(trkfit_ent_mc ,'mom')
       
@@ -597,15 +599,15 @@ def compare_datasets( files, cuts, locations, columns, signs):
     comparison.plot_particle_counts(mc_count, columns, plot_prefix=prefix)
     
     if signs[i] == "minus":
-       startmom = 99
-       endmom = 106
+       startmom = 95
+       endmom = 115
        nbins = 34
        comparison.plot_variable(recomom, r"Reconstructed Momentum [MeV/c]",f"{prefix}_recomom", startmom, endmom, [103.34,103.34],[104.74,104.74], mc_count,columns, nbins=nbins)
     else:
-        startmom = 85
-        endmom = 97
-        nbins = 15
-        comparison.plot_variable(recomom, r"$p_e$ [MeV/c]",f"{prefix}_recomom", startmom, endmom, [90.85,90.85],[92.1,92.1], mc_count,columns, nbins=nbins)
+        startmom = 95
+        endmom = 115
+        nbins = 34
+        comparison.plot_variable(recomom, r"Reconstructed Momentum [MeV/c]",f"{prefix}_recomom", startmom, endmom, [0,0],[0,0], mc_count,columns, nbins=nbins)
     comparison.plot_variable(crv, "|DT| [ns]",f"{prefix}_DT",0,300, [150,150],[150,150], mc_count,columns)
     comparison.plot_variable(nST, "nST",f"{prefix}_nST",0,15, [1,1],[1,1], mc_count,columns, 15)
     comparison.plot_variable(nOPA, "nOPA",f"{prefix}_nOPA",0,4, [0,0],[0,0], mc_count,columns,4)
@@ -685,32 +687,22 @@ def fit_dataset(files, cuts, locations, columns, signs, proctype):
       
       mom_mag_mc = vector.get_mag(trkfit_ent_mc ,'mom')
 
-      # get resolution:
-      resolution = comparison.compare_resolution(mom_mag,mom_mag_mc)
-      
-      # for loss studies:
-      origin = ak.mask(combine_result['trkmc']["trkmcsim"] , (combine_result['trkmc']["trkmcsim"]["rank"] == 0) & (combine_result['trkmc']["trkmcsim"]["nhits"] > 0))
-      originmom.append((vector.get_mag(origin,'mom')))
+      time = ak.nan_to_none(trkfit_ent['time'])
+      time = ak.drop_none(time)
+      times.append(time)
 
 
-
-      # get resolution:
-      resolution = comparison.compare_resolution(mom_mag_mc, mom_mag)
-      resolution_origin = comparison.compare_resolution(mom_mag,(vector.get_mag(origin,'mom')))
-      loss  = comparison.compare_resolution( (vector.get_mag(origin,'mom')), mom_mag_mc)
-      #times.append(time)
-      losses.append(loss)
-      truemom.append(mom_mag_mc)
-      resolutions_origin.append(resolution_origin)
-      resolutions.append(resolution)
     if proctype == "ensemble":
-        WriteFittedData(recomom, 90, 120)
+        WriteFittedData(recomom, times, 90, 120)
     if proctype == "cosmics":
         cosmics = Cosmics()
         cosmics.fit_momentum(recomom)
+        cosmics.fit_time(times, columns)
     if proctype == "rpc":
         rpc = RPC()
-        rpc.fit_momentum(recomom, columns)
+        rpc.fit_momentum(recomom, columns, opt="poly")
+        #rpc.CR_momentum(recomom, columns)
+        rpc.fit_time(times, columns)
     # Generate RLE calibration parameters for ensemble
     if proctype == "rle":
         rle_results = generate_rle_calibration(combine_result, "RLE/common", run_fits=True)
@@ -718,6 +710,18 @@ def fit_dataset(files, cuts, locations, columns, signs, proctype):
         rle_results = generate_rle_calibration(combine_result, "RLE/common", run_fits=False)
     if proctype == "rle_v2":
             rlev2 = RLE_v2()
+            # get resolution:
+            # for loss studies:
+            origin = ak.mask(combine_result['trkmc']["trkmcsim"] , (combine_result['trkmc']["trkmcsim"]["rank"] == 0) & (combine_result['trkmc']["trkmcsim"]["nhits"] > 0))
+            originmom.append((vector.get_mag(origin,'mom')))
+            resolution = comparison.compare_resolution(mom_mag_mc, mom_mag)
+            resolution_origin = comparison.compare_resolution(mom_mag,(vector.get_mag(origin,'mom')))
+            loss  = comparison.compare_resolution( (vector.get_mag(origin,'mom')), mom_mag_mc)
+            #times.append(time)
+            losses.append(loss)
+            truemom.append(mom_mag_mc)
+            resolutions_origin.append(resolution_origin)
+            resolutions.append(resolution)
             rlev2.fit_momentum(originmom, 90, 120, opt="poly", label = "Origin Momentum [MeV/c]")
             rlev2.fit_momentum(losses, -5,0,opt="landau",label = "Origin Momentum - True Momentum at TrkEnt [MeV/c]")
             #rlev2.fit_time(times, 450,1695,opt="piexp",label = "time at TrkFront [ns]")
@@ -771,9 +775,15 @@ def fit_dataset(files, cuts, locations, columns, signs, proctype):
 
     if proctype == "eff": # flat eff
         rle = RLE_v2()
-        
+        origin = ak.mask(combine_result['trkmc']["trkmcsim"] , (combine_result['trkmc']["trkmcsim"]["rank"] == 0) & (combine_result['trkmc']["trkmcsim"]["nhits"] > 0))
+        originmom.append((vector.get_mag(origin,'mom')))
+            
         rle.fit_momentum(originmom, 90,120,opt="poly", label = r"$p_{gen}$ [MeV/c]",nbins=50)
         rle.fit_momentum(originmom, 101,109,opt="linear", label = r"$p_{gen}$ [MeV/c]",nbins=20)
+
+    if proctype == "mutime":
+        rle = RLE_v2()
+        rle.fit_time(times, columns)
 
     if proctype == "CE": #endpoint
         rle = RLE_v2()
@@ -805,7 +815,7 @@ def fit_dataset(files, cuts, locations, columns, signs, proctype):
 
 
 
-def WriteFittedData(data, min_v, max_v):
+def WriteFittedData(data, time_data, min_v, max_v):
     """ Write data used in fit to csv (i,mom,time) Note: should be in format useful to BAT"""
     flat_mom = ak.flatten(data, axis = None)
     flat_np = np.array(flat_mom)
@@ -1458,16 +1468,16 @@ def  main(args):
       True,  #10 has_st
       True,  #11 no_opa
       True,  #12 no_crv_veto
-      True,  #13 no_crv_quality
+      False,  #13 no_crv_quality
       True,  #14 no_crv_timewindow
       True,  #15 pz/pt
-      True,  #16 triggers
-      False,  #17 in_mom_range
+      False,  #16 all triggers - DEPRECATED!!!!!
+      True,  #17 in_mom_range
       False, #18 within_t0_early
       True, #19 no_reflected
-      False,  #20 within_t0
-      False, # 21 signal region cut
-      False # or trigger select
+      True,  #20 within_t0
+      True, # 21 signal region cut
+      True  # or trigger select
     ]
   if args.sign == "plus":
     new= [
@@ -1475,7 +1485,7 @@ def  main(args):
       True,  # 1 has_downstream
       True, # 2 has trk front
       True,  # 3 good_trkqpid
-      True,  # 4 good_trkqual
+      False,  # 4 good_trkqual
       True,  # 5 within_t0err
       True,  # 6 has_hits
       False, # 7 within_lhr_maxl
@@ -1484,15 +1494,16 @@ def  main(args):
       True,  #10 has_st
       True,  #11 no_opa
       True,  #12 no_crv_veto
-      True,  #13 no_crv_quality
+      False,  #13 no_crv_quality
       True,  #14 no_crv_timewindow
       True,  #15 pz/pt
-      True,  #16 triggers
-      False,  #17 in_mom_range
-      False, #18 within_t0_early
-      False, #19 no_reflected
-      True,  #20 within_t0
-      True # or trigger select
+      False,  #16 all triggers - DEPRECATED!!!!!
+      True,  #17 in_mom_range
+      True, #18 within_t0_early
+      True, #19 no_reflected
+      False,  #20 within_t0
+      False, # 21 signal region cut
+      True  # or trigger select
     ]
 
   print("starting main function with cuts:", new)
@@ -1501,10 +1512,10 @@ def  main(args):
     return
 
   if args.proctype == "rpc":
-    files = ["file_lists_full/IntRPC_MDC2025an_nomix.txt","file_lists_full/IntRPC_MDC2025an_nomix.txt"]
-    signs = ["minus","plus"]
+    files = ["file_lists_full/IntRPC_MDC2025an_nomix.txt","file_lists_full/ExtRPC_MDC2025an_nomix.txt"]
+    signs = ["minus","minus"]
     locations = [args.loc,args.loc]
-    columns = ["internal e-","internal e+"]
+    columns = ["Internal RPC e-","External RPC e-"]
     cuts = [new,new]
     fit_dataset(files, cuts, locations, columns, signs, args.proctype)
 
@@ -1525,7 +1536,7 @@ def  main(args):
   files = [args.file]
   signs = [args.sign]
   locations = [args.loc]
-  columns = ["Run1A"]
+  columns = ["Run-1"]
   cuts = [new]
   #compare_datasets(files, cuts, locations, columns, signs)
   fit_dataset(files, cuts, locations, columns, signs, args.proctype)

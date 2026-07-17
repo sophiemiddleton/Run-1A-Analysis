@@ -336,6 +336,7 @@ class Analyze:
     
             # Check if within threshold
             within_threshold = dt < dt_threshold
+            
             """
             fig, (ax1) = plt.subplots(1,1)
             n,bins,patch = plt.hist(ak.flatten(dt, axis=None), bins=50, range=(0,300), histtype='bar', color='red')
@@ -450,22 +451,23 @@ class Analyze:
                 active= self.switch[15]
             )
 
+            
 
             # momentum selection
             vector = Vector()
             trkfit_ent = ak.mask(data['trkfit']["trksegs"], at_trk_front)
             mom_mag = vector.get_mag(trkfit_ent, 'mom')
-            in_mom_range = ((95 < mom_mag) & (mom_mag < 115))
+            in_mom_range = ((97 < mom_mag) & (mom_mag < 110))
             in_mom_range = ak.all(~at_trk_front | in_mom_range, axis=-1)
             cut_manager.add_cut(
                 name="in_mom_range",
-                description=" 95 < mom < 115",
+                description=" 97 < mom < 110 ",
                 mask=in_mom_range,
                 active=self.switch[17]
             )
 
             within_t0_early = ((0 < data['trkfit']["trksegs"]["time"]) & 
-                         (data['trkfit']["trksegs"]["time"] < 700))
+                         (data['trkfit']["trksegs"]["time"] < 500))
         
             # trk-level definition (the actual cut)
             within_t0_early = ak.all(~at_trk_front | within_t0_early, axis=-1)
@@ -478,21 +480,21 @@ class Analyze:
 
            
             # 12. trksegs level - within_t0 (moved to end)
-            within_t0 = ((640 < data['trkfit']["trksegs"]["time"]) & 
+            within_t0 = ((475 < data['trkfit']["trksegs"]["time"]) & 
                             (data['trkfit']["trksegs"]["time"] < 1650))
 
             # trk-level definition (the actual cut)
             within_t0 = ak.all(~at_trk_front | within_t0, axis=-1)
             cut_manager.add_cut( 
                 name="within_t0",
-                description="t0 at tracker (640 < t_0 < 1650 ns) ",
+                description="t0 at tracker (475 < t_0 < 1650 ns) ",
                 mask=within_t0,
                 active= self.switch[20]
             )
 
             # Signal region cut: momentum and time selection
             # Momentum: 103.6 < mom < 104.9
-            signal_mom_mask = ((103.34 < mom_mag) & (mom_mag < 104.74))
+            signal_mom_mask = ((103.34 < mom_mag) & (mom_mag <104.74))
             signal_mom_mask = ak.all(~at_trk_front | signal_mom_mask, axis=-1)
    
             # Time: 640 < t < 1650 ns
@@ -504,7 +506,7 @@ class Analyze:
             signal_region = signal_mom_mask & signal_time_mask
             cut_manager.add_cut(
                 name="signal_region",
-                description="Signal region: 103.34 < mom < 104.74 MeV, 640 < t < 1650 ns",
+                description="Signal region: 103.34 < mom < 104.74, 640 < t < 1650 ns",
                 mask=signal_region,
                 active= self.switch[21]
             )

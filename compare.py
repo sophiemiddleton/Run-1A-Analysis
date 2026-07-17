@@ -199,7 +199,6 @@ class Compare():
          ax1.text(0.35, 0.97, r"$R_{\mu e} = 1 \times 10^{-13}$" + "\n" + "t = 28 days" + "\n" + r"$N_{\mathrm{POT}} = 7.3 \times 10^{18}$" , fontsize=14, ha='right', va='top', transform=ax1.transAxes, zorder=100, bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgrey', edgecolor='black', alpha=0.8))
       plt.savefig(str(filenames)+"_selection.png", bbox_inches='tight')
       plt.show()
-      
     
 
     def compare_resolution(self, recomom, truemom):

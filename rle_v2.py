@@ -13,6 +13,7 @@ import zfit.z.numpy as znp
 # Publication-style matplotlib defaults
 import matplotlib.font_manager as mfm
 import matplotlib as mpl
+import matplotlib.ticker as ticker
 preferred_serifs = ['DejaVu Serif', 'Times New Roman', 'Times', 'Palatino']
 available_fonts = {f.name for f in mfm.fontManager.ttflist}
 chosen_serif = next((f for f in preferred_serifs if f in available_fonts), 'DejaVu Serif')
@@ -789,7 +790,7 @@ class RLE_v2():
       total_events = np.sum(data_hist)
       convolved_scaled = convolved_vals * total_events * bin_width_hist
       ax.plot(momentum_grid.flatten(), convolved_scaled, 'r-', linewidth=2.5, 
-          label=f'Post-Fit Theory\n($\mu$={mu_fit:.3f}, $\sigma$={sigma_fit:.3f})')
+          label=r'Post-Fit Theory\n($\mu$={mu_fit:.3f}, $\sigma$={sigma_fit:.3f})')
 
       ax.set_ylabel('Events per bin', fontsize=14)
       ax.set_title(f'{proctype} Unbinned ML Fit with Constraints', fontsize=16, fontweight='bold')
@@ -825,6 +826,138 @@ class RLE_v2():
       print(f"  ✓ Saved post-fit diagnostics to Fit_{plot_label}.pdf")
 
       return result
+
+    def fit_time(self, data_list, labels):
+        """
+        Plots the reconstructed time data and its statistical uncertainties
+        using an extended unbinned maximum likelihood fit with an exponential shape,
+        including goodness of fit and pull distribution.
+        Styled identically to the momentum fitting method.
+        """
+        # Create figure matching structure of fit_momentum (Main plot + Pull plot)
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True, gridspec_kw={'height_ratios': [3, 1]})
+        colors = ["black"]
+        linecolors = ["red"]
+        
+        # Text box lists to compile multi-dataset information cleanly
+        param_text_elements = []
+        
+        # Consistent layout limits and definition
+        fit_range = (475, 1650)
+        n_bins = 100
+        bin_width = (fit_range[1] - fit_range[0]) / n_bins
+        
+        last_norm = 0.0
+        for i, data in enumerate(data_list):
+            time_skim = ak.nan_to_none(data)
+            time_skim = ak.drop_none(time_skim)
+
+            # Define the observable space for the fit matching fit_range
+            obs_time = zfit.Space('x', limits=fit_range)
+            time_np = ak.to_numpy(ak.flatten(time_skim, axis=None))
+            time_zfit = zfit.Data.from_numpy(array=time_np, obs=obs_time)
+            n_events_raw = len(time_np)
+            
+            # Initialize extended parameter at raw count size
+            N_RPC = zfit.Parameter(f'N_RPC_time_{i}', n_events_raw, 100, n_events_raw * 10)
+            c1 = zfit.Parameter(f"c1_{i}", 0.001, -1, 1)
+            coeffs = [c1]
+            fitcurve = zfit.pdf.Exponential(obs=obs_time, lam=c1, extended=N_RPC)
+
+            # Perform the extended unbinned NLL fit
+            nll = zfit.loss.ExtendedUnbinnedNLL(model=fitcurve, data=time_zfit)
+            minimizer = zfit.minimize.Minuit()
+            result = minimizer.minimize(loss=nll)
+            hesse_errors = result.hesse()
+            print(result)
+            
+            # Normalization factor calculations matching momentum style
+            target_events = 100000.0
+            norm_factor = target_events / n_events_raw  
+
+            # Histogramming raw data
+            counts_raw, bins = np.histogram(time_np, bins=n_bins, range=fit_range)
+            data_bin_center = (bins[:-1] + bins[1:]) / 2
+            
+            counts_norm = counts_raw * norm_factor
+            errors_norm = np.sqrt(counts_raw) * norm_factor
+            
+            nonzero_mask = counts_raw > 0
+            
+            # Plot markers on Main Axis (ax1)
+            ax1.errorbar(data_bin_center[nonzero_mask], counts_norm[nonzero_mask], 
+                        yerr=errors_norm[nonzero_mask], 
+                        fmt='o', color=colors[i], markerfacecolor='white', markeredgecolor=colors[i], 
+                        markersize=4, capsize=0, elinewidth=1, label=f'{labels[i]} Stat. unc.')
+            
+            # Plot step histogram using weights
+            weights = np.full_like(time_np, norm_factor)
+            ax1.hist(time_np, bins=n_bins, range=fit_range, weights=weights,
+                    color=colors[i], histtype='step', linewidth=1.2, label=labels[i])
+
+            # Generate and plot fit curve
+            time_plot = np.linspace(fit_range[0], fit_range[1], 500).reshape(-1, 1)
+            fitcurve_curve = zfit.run(fitcurve.ext_pdf(time_plot)) * bin_width * norm_factor
+            
+            ax1.plot(time_plot.flatten(), fitcurve_curve.flatten(), color=linecolors[i], linestyle="--", linewidth=2.5, label=f'Fit')
+            
+            # Calculate Chi2 / DOF
+            fit_at_bin_center_raw = zfit.run(fitcurve.ext_pdf(data_bin_center.reshape(-1, 1))) * bin_width
+            chi2 = np.sum(((counts_raw - fit_at_bin_center_raw) ** 2) / (counts_raw + 1e-6))
+            dof = n_bins - len(coeffs) - 1
+            chi2_dof = chi2 / dof if dof > 0 else 0
+            
+            # Calculate and plot pulls on Second Axis (ax2)
+            residual_norm = counts_norm - (fit_at_bin_center_raw * norm_factor)
+            pull_errors = np.where(counts_raw > 0, errors_norm, 1.0 * norm_factor)
+            pull = residual_norm / pull_errors
+            pull_err = np.ones_like(pull)
+            
+            ax2.errorbar(data_bin_center, pull, yerr=pull_err, 
+                        fmt='.', color=colors[i], capsize=0, markersize=6)
+                
+            # Formatting text box entries
+            clean_label = labels[i].replace(" ", r"\ ")
+            dataset_text = (
+                #f"$\\mathbf{{{clean_label}}}:$\n"
+                f"$\\lambda = {result.params[c1]['value']:.6f} \\pm {hesse_errors[c1]['error']:.6f}$\n"
+                f"$\\chi^2/\\text{{DOF}} = {chi2_dof:.2f}$"
+            )
+            param_text_elements.append(dataset_text)
+            
+            last_norm = result.params[N_RPC]['value']
+
+        # Consolidated parameter box presentation
+        combined_param_text = "\n\n".join(param_text_elements)
+        props = dict(boxstyle='round,pad=0.5', facecolor='lightgrey', alpha=0.75, edgecolor='gray')
+        ax1.text(0.95, 0.95, combined_param_text, transform=ax1.transAxes,
+            fontsize=20, horizontalalignment='right', verticalalignment='top', bbox=props)
+        
+        # Uniform layout configuration
+        ax1.set_ylabel(f'Events / {bin_width:.1f} ns', fontsize=mpl.rcParams.get('axes.titlesize', 24))
+        ax1.text(0.0, 1.02, "Mu2e Simulation", 
+                fontsize=20, fontweight='bold', ha='left', va='bottom', transform=ax1.transAxes, zorder=100)
+        ax1.legend(fontsize=14)
+        
+        ax2.axhline(0, color='black', linestyle='--', linewidth=1)
+        ax2.set_ylabel(r'Pull [$\sigma$]', fontsize=mpl.rcParams.get('axes.titlesize', 24))
+        ax2.set_xlabel('Track Time [ns]', fontsize=mpl.rcParams.get('axes.titlesize', 24))
+        ax2.set_ylim(-3.5, 3.5)
+        
+        # Matching minor/major tick configurations exactly
+        ax1.minorticks_on()
+        ax1.tick_params(direction='in', which='both', top=True, right=True, labelsize=14)
+        ax1.yaxis.set_minor_formatter(ticker.NullFormatter()) 
+        ax2.minorticks_on()
+        ax2.tick_params(direction='in', which='both', top=True, right=True, labelsize=14)
+        ax2.yaxis.set_minor_locator(ticker.MultipleLocator(0.5))
+        ax2.xaxis.set_minor_locator(ticker.AutoMinorLocator())
+        
+        plt.tight_layout()
+        plt.savefig("MuTimefit.pdf", bbox_inches='tight')
+        plt.show()
+        
+        return last_norm
 
     def fit_momentum(self, data_list, start, end, opt, label,nbins):
         """
