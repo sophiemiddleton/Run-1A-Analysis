@@ -811,7 +811,8 @@ def fit_dataset(files, cuts, locations, columns, signs, proctype):
                                    plot_label='fit_result')
     if proctype == "CELL": 
         rle = RLE_v2()
-        rle.fit_momentum(recomom, 85,115,opt="dscb", label = r"$p_{reco} $ [MeV/c]")
+        rle.fit_CELL_momentum_dscb(recomom, 100,106,opt="dscb", label = r"$p_{reco} $ [MeV/c]",nbins=100)
+        #rle.fit_momentum(recomom, 85,115,opt="dscb", label = r"$p_{reco} $ [MeV/c]",nbins=50)
 
 
 
@@ -1476,7 +1477,7 @@ def  main(args):
       False, #18 within_t0_early
       True, #19 no_reflected
       True,  #20 within_t0
-      True, # 21 signal region cut
+      False, # 21 signal region cut
       True  # or trigger select
     ]
   if args.sign == "plus":
@@ -1539,7 +1540,9 @@ def  main(args):
   columns = ["Run-1"]
   cuts = [new]
   #compare_datasets(files, cuts, locations, columns, signs)
+
   fit_dataset(files, cuts, locations, columns, signs, args.proctype)
+  """
   if args.proctype == "CELL":
     fig, ax = plot_theory_with_rle(
       files=files,
@@ -1549,6 +1552,7 @@ def  main(args):
       jobs=args.jobs,
       rle_calib_dir="RLE/common"
     )
+  """
   print("Done plotting")
   return
   

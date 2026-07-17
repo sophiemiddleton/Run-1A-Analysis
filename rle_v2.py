@@ -1265,6 +1265,124 @@ class RLE_v2():
         plt.show()
         return  norm
 
+    def fit_CELL_momentum_dscb(self, data_list, start, end, opt, label, nbins):
+        """
+        Fits a Double-Sided Crystal Ball shape to the reconstructed momentum data
+        using an extended unbinned maximum likelihood fit.
+        """
+        # Create figure with two subplots: main plot and pull plot
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True, gridspec_kw={'height_ratios': [3, 1]})
+        
+        norm = 0.
+        for i, data in enumerate(data_list):
+            mom_mag_skim = ak.drop_none(ak.nan_to_none(data))
+            mom_np = ak.to_numpy(ak.flatten(mom_mag_skim, axis=None))
+
+            # Define the observable space for the fit
+            obs_mom = zfit.Space('x', limits=(start, end))
+            mom_zfit = zfit.Data.from_numpy(array=mom_np, obs=obs_mom)
+            
+            # Define parameters for the DSCB shape and yield
+            N_Flat = zfit.Parameter('N_Flat', 5000, 1000, 1000000)
+            mu = zfit.Parameter("mu", 104, 100, 105)
+            sigma = zfit.Parameter("sigma", 0.5, 0.1, 5.0)
+            alphal = zfit.Parameter("alphal", 0.5, 0.1, 5.0)
+            nl = zfit.Parameter("nl", 2.0, 0.1, 20.0)
+            alphar = zfit.Parameter("alphar", 0.5, 0.1, 5.0)
+            nr = zfit.Parameter("nr", 2.0, 0.1, 20.0)
+            
+            ax1.set_yscale('log')
+            poly_model = zfit.pdf.DoubleCB(
+                mu=mu, sigma=sigma, alphal=alphal, nl=nl, alphar=alphar, nr=nr, 
+                obs=obs_mom, extended=N_Flat
+            )
+
+            # Minimize the loss and get the result
+            nll = zfit.loss.ExtendedUnbinnedNLL(model=poly_model, data=mom_zfit)
+            minimizer = zfit.minimize.Minuit()
+            result = minimizer.minimize(loss=nll)
+            hesse_errors = result.hesse()
+            print(result)
+            
+            # --- Plotting Setup ---
+            fit_range = (obs_mom.lower[0, 0], obs_mom.upper[0, 0])
+            bin_width = (fit_range[1] - fit_range[0]) / nbins
+            
+            # 1. Plot Smooth Curve
+            mom_plot = np.linspace(fit_range[0], fit_range[1], 500).reshape(-1, 1)
+            poly_model_curve = zfit.run(poly_model.pdf(mom_plot) * result.params[N_Flat]['value'] * bin_width)
+            ax1.plot(mom_plot.flatten(), poly_model_curve.flatten(), color="red", linestyle="-", linewidth=2, label='Fit')
+            
+            # 2. Extract and Plot Data Points
+            counts, bins = np.histogram(mom_np, bins=nbins, range=fit_range)
+            data_bin_center = (bins[:-1] + bins[1:]) / 2
+            errors = np.sqrt(counts)
+            nonzero_mask = counts > 0
+            
+            ax1.errorbar(data_bin_center[nonzero_mask], counts[nonzero_mask], 
+                        yerr=errors[nonzero_mask], 
+                        fmt='o', color='black', markerfacecolor='white', markeredgecolor='black', 
+                        markersize=4, capsize=0, elinewidth=1, label='Stat. unc.')
+            
+            data_hist, _, _ = ax1.hist(mom_np, bins=nbins, range=fit_range,
+                                    color="black", histtype='step', linewidth=1.2, label='Flat Electron MC')
+
+            # 3. Dynamic Axis Formatting
+            ax1.set_ylabel(f'Events / {bin_width:.2f} MeV/c', fontsize=mpl.rcParams.get('axes.titlesize', 24))
+            
+            # Dynamic limits using actual data bounds
+            min_y = max(0.1, np.min(counts[nonzero_mask]) * 0.2)
+            max_y = np.max(counts[nonzero_mask]) * 5.0
+            ax1.set_ylim(min_y, max_y)
+            
+            ax1.text(0.0, 1.02, "Mu2e Simulation", fontsize=20, fontweight='bold', ha='left', va='bottom', transform=ax1.transAxes)
+            ax1.legend(fontsize=16)
+            
+            # --- Parameter Text Box ---
+            param_text = (
+                f"$\\mu = {result.params[mu]['value']:.3f} \\pm {hesse_errors[mu]['error']:.4f}$\n"
+                f"$\\sigma = {result.params[sigma]['value']:.3f} \\pm {hesse_errors[sigma]['error']:.4f}$\n"
+                f"$\\alpha_{{l}} = {result.params[alphal]['value']:.3f} \\pm {hesse_errors[alphal]['error']:.4f}$\n"
+                f"$n_{{l}} = {result.params[nl]['value']:.3f} \\pm {hesse_errors[nl]['error']:.4f}$\n"
+                f"$\\alpha_{{r}} = {result.params[alphar]['value']:.3f} \\pm {hesse_errors[alphar]['error']:.4f}$\n"
+                f"$n_{{r}} = {result.params[nr]['value']:.3f} \\pm {hesse_errors[nr]['error']:.4f}$"
+            )
+            props = dict(boxstyle='round,pad=0.5', facecolor='lightgrey', alpha=0.75, edgecolor='gray')
+            ax1.text(0.05, 0.65, param_text, transform=ax1.transAxes, fontsize=16, horizontalalignment='left', verticalalignment='bottom', bbox=props)
+            
+            # --- Pull Plot ---
+            data_bin_center_2d = data_bin_center.reshape(-1, 1)
+            fit_at_bin_center = zfit.run(poly_model.pdf(data_bin_center_2d) * result.params[N_Flat]['value'] * bin_width)
+            
+            valid_mask = counts > 0
+            if np.any(valid_mask):
+                residual = counts - fit_at_bin_center
+                pull = np.divide(residual, errors, where=valid_mask, out=np.zeros_like(counts, dtype=np.float64))
+                pull_err = np.ones_like(pull)
+                ax2.errorbar(data_bin_center[valid_mask], pull[valid_mask], yerr=pull_err[valid_mask], fmt='.', color='black', capsize=0)
+            else:
+                ax2.plot(data_bin_center, np.zeros_like(counts), '.', color='black', markersize=4)
+                
+            ax2.axhline(0, color='black', linestyle='--', linewidth=1)
+            ax2.set_ylabel(r'Pull [$\sigma$]', fontsize=mpl.rcParams.get('axes.titlesize', 24))
+            ax2.set_xlabel(str(label), fontsize=mpl.rcParams.get('axes.titlesize', 24))
+            ax2.set_ylim(-3.5, 3.5)
+            norm = result.params[N_Flat]['value']
+
+        import matplotlib.ticker as ticker
+        ax1.minorticks_on()
+        ax1.tick_params(direction='in', which='both', top=True, right=True, labelsize=14)
+        ax1.yaxis.set_minor_formatter(ticker.NullFormatter()) 
+        ax2.minorticks_on()
+        ax2.tick_params(direction='in', which='both', top=True, right=True, labelsize=14)
+        ax2.yaxis.set_minor_locator(ticker.MultipleLocator(0.5))
+        ax2.xaxis.set_minor_locator(ticker.AutoMinorLocator())
+        
+        plt.tight_layout()
+        plt.savefig("CE_dscb.pdf", bbox_inches='tight')
+        plt.show()
+        return norm
+        
     def overlay_fit(self, c1, c2, c3, c4, c5, data_list, mc_count):
         """
         Fits a simple Polynomial shape to the reconstructed momentum data
