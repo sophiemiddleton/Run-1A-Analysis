@@ -97,12 +97,12 @@ class Analyze:
                     name="one_reco_electron",
                     description="One reco electron / event",
                     mask=one_reco_electron,
-                    active=False#self.switch[0]
+                    active=self.switch[0]
                 )
                 # Append for debugging 
                 data["one_reco_electron"] = one_reco_electron
                 data["one_reco_electron_per_event"] = one_reco_electron_per_event
-    
+
             if (str(self.sign) == "plus"):
                 is_reco_positron = selector.is_positron(data["trk"])
                 data["is_reco_positron"] = is_reco_positron
@@ -146,7 +146,135 @@ class Analyze:
             )
             data["no_upstream"] = is_upstream
             
+            # 3. Multiple downstream electron veto (for "minus" sign)
+            # Ensures only ONE downstream electron fit per event
+            # Counts entries that are BOTH downstream AND electron
+            # Rejects events with multiple downstream electron hypotheses (pileup/confusion)
+            if (str(self.sign) == "minus"):
+                is_reco_electron = selector.is_electron(data["trk"])
+                is_downstream_electron = is_downstream & is_reco_electron
+                n_downstream_electron = ak.sum(is_downstream_electron, axis=-1)
+                exactly_one_downstream_electron_per_event = n_downstream_electron <= 1
+                
+                # Broadcast to track level
+                exactly_one_de, _ = ak.broadcast_arrays(exactly_one_downstream_electron_per_event, is_downstream_electron)
+                one_downstream_electron = is_downstream_electron & exactly_one_de
+                
+                cut_manager.add_cut(
+                    name="one_downstream_electron",
+                    description="At most one downstream electron fit per event",
+                    mask=one_downstream_electron,
+                    active=self.switch[2]
+                )
+                data["one_downstream_electron"] = one_downstream_electron
+                
+                if self.verbosity >= 2:
+                    n_events_with_multi = ak.sum(n_downstream_electron > 1)
+                    n_events_total = len(n_downstream_electron)
+                    self.logger.log(f"Events with multiple downstream electrons: {n_events_with_multi}/{n_events_total}", "debug")
 
+            # 3. Find best upstream match for downstream tracks (association/matching step)
+            # This is NOT a cut - it's a matching step to find correlated upstream tracks
+            # For each downstream track, find the single best upstream match using ranking:
+            # - First, prefer high quality tracks (good trkqual & fitcon)
+            # - Then, prefer smallest dt
+            # - Finally, prefer best fitcon
+            self.logger.log("Matching upstream tracks to downstream", "max")
+            
+            # Time difference thresholds (in ns)
+            min_dt_match = 30.0
+            max_dt_match = 250.0
+            qual_threshold_e = 0.1
+            qual_threshold_mu = 0.01
+            fitcon_threshold = 1.e-5
+            
+            # Identify track types
+            is_upstream = ~is_downstream
+            is_electron = selector.is_electron(data["trk"])
+            is_muon = selector.is_mu_minus(data["trk"])
+            
+            # Get track parameters
+            trk_t_front = data['trkfit']["trksegs"]["time"][at_trk_front]  # (events, tracks, segments)
+            trk_t_front_mean = ak.mean(trk_t_front, axis=-1, keepdims=False)  # (events, tracks)
+            
+            trk_qual = data["trk"]["trkqual.result"]      # (events, tracks)
+            fit_con = data["trk"]["trk.fitcon"]           # (events, tracks)
+            
+            # Time difference matrix (events, track_i, track_j)
+            dt_matrix = trk_t_front_mean[:, :, None] - trk_t_front_mean[:, None, :]
+            
+            # Quality matrices
+            qual_matrix = trk_qual[:, None, :] > qual_threshold_e  # Shape: (events, 1, tracks)
+            fitcon_matrix = fit_con[:, None, :] > fitcon_threshold
+            is_good_quality = qual_matrix & fitcon_matrix
+            
+            # Upstream mask
+            is_upstream_expanded = is_upstream[:, None, :]
+            
+            # Time window mask
+            in_time_window = (dt_matrix > min_dt_match) & (dt_matrix < max_dt_match)
+            
+            # Valid candidates: must be upstream and in time window
+            valid_candidates = in_time_window & is_upstream_expanded
+            
+            # To implement the C++ ranking logic for finding best match:
+            # 1. Among candidates with good quality, pick smallest dt
+            # 2. If no good quality candidates, pick smallest dt anyway
+            # 3. Break ties with fitcon
+            
+            # Apply quality mask to dt (set non-quality candidates to inf for first pass)
+            dt_if_good_quality = ak.where(is_good_quality & valid_candidates, dt_matrix, float('inf'))
+            dt_if_any = ak.where(valid_candidates, dt_matrix, float('inf'))
+            
+            # Find minimum dt among good quality candidates
+            min_dt_good = ak.min(dt_if_good_quality, axis=2)
+            
+            # If no good quality candidates exist, use any candidate with min dt
+            has_good_quality_match = min_dt_good < float('inf')
+            min_dt_to_use = ak.where(has_good_quality_match, min_dt_good, ak.min(dt_if_any, axis=2))
+            
+            # Track which downstream tracks have valid upstream matches (for reference only)
+            n_valid_per_downstream = ak.sum(valid_candidates, axis=2)
+            has_upstream_match = n_valid_per_downstream > 0
+            
+            # Store results - these are for analysis, not cuts
+            data["has_upstream_match"] = has_upstream_match
+            data["best_match_dt"] = min_dt_to_use
+            
+            if self.verbosity >= 2:
+                n_with_match = ak.sum(has_upstream_match & is_downstream)
+                n_downstream = ak.sum(is_downstream)
+                self.logger.log(f"Downstream tracks with upstream match: {n_with_match}/{n_downstream}", "debug")
+                
+                # Distribution of best match dt (only for tracks with matches)
+                valid_dt_values = min_dt_to_use[has_upstream_match & is_downstream]
+                if len(valid_dt_values) > 0:
+                    self.logger.log(f"Best match dt: mean={ak.mean(valid_dt_values):.1f}, min={ak.min(valid_dt_values):.1f}, max={ak.max(valid_dt_values):.1f} ns", "debug")
+            
+            # Debug plot for upstream matching
+            if self.verbosity >= 3:
+                try:
+                    valid_dt_values = ak.to_numpy(min_dt_to_use[has_upstream_match & is_downstream])
+                    if len(valid_dt_values) > 0:
+                        fig, ax = plt.subplots(figsize=(10, 6))
+                        ax.hist(valid_dt_values, bins=50, range=(min_dt_match, max_dt_match), 
+                               histtype='step', color='blue', linewidth=2, label='Best upstream matches')
+                        ax.set_xlabel('Time Difference (ns)', fontsize=12)
+                        ax.set_ylabel('Counts', fontsize=12)
+                        ax.set_title('Best Upstream Track Match - Time Difference Distribution')
+                        ax.legend()
+                        ax.grid(True, alpha=0.3)
+                        plt.tight_layout()
+                        plt.savefig('upstream_dt_distribution.png', dpi=100, bbox_inches='tight')
+                        plt.close()
+                        self.logger.log("Saved upstream_dt_distribution.png", "debug")
+                except Exception as e:
+                    self.logger.log(f"Could not create upstream debug plot: {e}", "debug")
+
+            # 3. Ensure exactly one downstream track per event
+            # DISABLED: This cut counts hypothesis fits instead of physical tracks,
+            # which over-rejects events where a single track has multiple hypothesis fits.
+            # The one_reco_electron cut above is the correct requirement.
 
             # trigger_new
             # 1. Define the individual triggers
@@ -214,7 +342,7 @@ class Analyze:
                 name="good_trkpid",
                 description="Track PID > 0.67",
                 mask=good_trkpid,
-                active= self.switch[3] 
+                active= self.switch[3]
             )
             data["good_trkpid"] = good_trkpid
 
@@ -225,7 +353,7 @@ class Analyze:
                 name="good_trkqual",
                 description="Track quality  > 0.2",
                 mask=good_trkqual,
-                active= self.switch[4] 
+                active= self.switch[4]
             )
             data["good_trkqual"] = good_trkqual
     
@@ -277,7 +405,7 @@ class Analyze:
                 name="within_d0",
                 description="Distance of closest approach (d_0 < 100 mm)",
                 mask=within_d0,
-                active= self.switch[8] 
+                active= self.switch[8]
         
             )
     
@@ -334,8 +462,11 @@ class Analyze:
             # Calculate time differences
             dt = abs(trk_broadcast - coinc_broadcast)
     
-            # Check if within threshold
-            within_threshold = dt < dt_threshold
+            # Compute minimum |dt| across all coincidences for each track
+            min_dt = ak.min(dt, axis=3)
+            
+            # Check if minimum dt is within threshold
+            any_coinc = min_dt < dt_threshold
             
             """
             fig, (ax1) = plt.subplots(1,1)
@@ -344,8 +475,6 @@ class Analyze:
             ax1.set_xlabel(r'$| T_{trk} - T_{crv}| [ns]$',fontsize=16)
             plt.show()
             """
-            # Basic coincidence (used for veto): any coincidence within dt threshold
-            any_coinc = ak.any(within_threshold, axis=3)
 
             # Additionally compute a separate CRV-quality flag (PEs, nHits, span)
             try:
@@ -354,11 +483,17 @@ class Analyze:
                 ts = data["crv"]["crvcoincs.timeStart"]
                 te = data["crv"]["crvcoincs.timeEnd"]
                 quality = (pe > 25) & (nh >= 15) & ((te - ts) < 175)
-                any_coinc_quality = ak.any(within_threshold & quality[:, None, None, :], axis=3)
+                # Find minimum |dt| among quality coincidences
+                dt_with_quality = ak.where(quality[:, None, None, :], dt, float('inf'))
+                min_dt_quality = ak.min(dt_with_quality, axis=3)
+                any_coinc_quality = min_dt_quality < dt_threshold
 
                 # CRV coincidence time-window selection: startTime > 429 and endTime < 1700
                 timewindow = (ts > 429) & (te < 1700)
-                any_coinc_timewindow = ak.any(within_threshold & timewindow[:, None, None, :], axis=3)
+                # Find minimum |dt| among timewindow coincidences
+                dt_with_timewindow = ak.where(timewindow[:, None, None, :], dt, float('inf'))
+                min_dt_timewindow = ak.min(dt_with_timewindow, axis=3)
+                any_coinc_timewindow = min_dt_timewindow < dt_threshold
 
             except Exception:
                 any_coinc_quality = ak.zeros_like(any_coinc)
