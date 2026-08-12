@@ -25,6 +25,7 @@ import xgboost as xgb
 from compare import Compare
 from cosmics import Cosmics
 from rpc import RPC
+from rmc import RMC
 from analyze import Analyze
 from rle import (
     generate_rle_calibration,
@@ -89,10 +90,14 @@ class AnaProcessor(Skeleton):
                 "crvcoincs.timeStart",
                 "crvcoincs.timeEnd"
             ],
+            "calo" : [
+               "caloclusters.energyDep_"
+            ],
             "trk" : [
                 "trk.nactive", 
                 "trk.pdg", 
                 "trk.status",
+                "trk.goodfit",
                 "trk.opainter",
                 "trk.chisq",
                 "trk.ndof",
@@ -100,6 +105,7 @@ class AnaProcessor(Skeleton):
                 "trkqual.result",
                 "trkpid.valid",
                 "trkpid.result",
+                "trk.fitcon"
             ],
             "trkfit" : [
                 "trksegs",
@@ -612,7 +618,7 @@ def compare_datasets( files, cuts, locations, columns, signs):
     comparison.plot_variable(nST, "nST",f"{prefix}_nST",0,15, [1,1],[1,1], mc_count,columns, 15)
     comparison.plot_variable(nOPA, "nOPA",f"{prefix}_nOPA",0,4, [0,0],[0,0], mc_count,columns,4)
     comparison.plot_variable(rmax, "rmax", f"{prefix}_rmax",300,750, [450,450],[680,680], mc_count,columns)
-    comparison.plot_variable(d0, "d0", f"{prefix}_d0",0, 250, [100,100], [100,100], mc_count,columns)
+    comparison.plot_variable(d0, "d0", f"{prefix}_d0",-200, 250, [100,100], [100,100], mc_count,columns)
     comparison.plot_variable(tanDip, "tanDip",f"{prefix}_tanDip",-1,2.5, [0.557,0.557], [1.0,1.0],mc_count,columns)
     comparison.plot_variable(trkqual, "trkqual", f"{prefix}_trkqual", 0,1,[0.2,0.2], [0.2, 0.2], mc_count,columns)
     comparison.plot_variable(trkpid, "trkpid", f"{prefix}_trkpid", 0,1,[0.6,0.6], [0.6, 0.6], mc_count,columns)
@@ -703,6 +709,9 @@ def fit_dataset(files, cuts, locations, columns, signs, proctype):
         rpc.fit_momentum(recomom, columns, opt="poly")
         #rpc.CR_momentum(recomom, columns)
         rpc.fit_time(times, columns)
+    if proctype == "rmc":
+        rmc = RMC()
+        rmc.fit_momentum(recomom, columns)
     # Generate RLE calibration parameters for ensemble
     if proctype == "rle":
         rle_results = generate_rle_calibration(combine_result, "RLE/common", run_fits=True)
@@ -1078,33 +1087,33 @@ def run_cut_optimization(file_list_path, sign="minus", cuts=None, locations='dis
     
     # Set default cuts if not provided
     if cuts is None:
-        if sign == "minus":
-            cuts= [
-                True,  # 0 is_reco_electron
-                True,  # 1 has_downstream
-                True, # 2 has trk front
-                False,  # 3 good_trkqpid
-                True,  # 4 good_trkqual
-                True,  # 5 within_t0err
-                True,  # 6 has_hits
-                False, # 7 within_lhr_maxl
-                False, # 8 within_d0
-                False, # 9 within_pitch_angle
-                False,  #10 has_st
-                False,  #11 no_opa
-                False,  #12 no_crv_veto
-                False,  #13 no_crv_quality
-                False,  #14 no_crv_timewindow
-                True,  #15 pz/pt
-                True,  #16 triggers
-                False,  #17 in_mom_range
-                False, #18 within_t0_early
-                False, #19 no_reflected
-                False, #20 within_t0
-                False  #21 signal_region
-                ]
-        else:
-            cuts = [True, True, True, True, True, True, True, False, False, False, False, False, False, False, False, False, True, False, False, False, False, False]
+        if sign == "minus" or sign == "plus":
+            cuts = [
+                True,  # 0: has_a_track
+                True,  # 1: is_good_track
+                True,  # 2: has_trk_front_seg
+                True,  # 3: is_reco_electron_or_positron
+                True,  # 4: has_downstream
+                True,  # 5: charge_selection
+                True,  # 6: or_trigger
+                True,  # 7: no_upstream
+                True,  # 8: upstream_veto (timing-based)
+                True,  # 9: no_multi_trk_veto
+                True,  # 10: good_trkpid
+                True,  # 11: pz_over_pt
+                True,  # 12: st_boundary
+                True,  # 13: has_st
+                True,  # 14: no_opa
+                True,  # 15: good_trkqual
+                True,  # 16: has_hits
+                True,  # 17: within_t0err
+                True,  # 18: no_crv_veto
+                True,  # 19: in_mom_range
+                True,  # 20: within_t0_475
+                True,  # 21: within_t0_540
+                True   # 22: within_t0_640
+            ]
+        
     
     # Step 2: Extract variables for optimization
     logger.log(f"\nStep 2: Extracting variables for optimization", "info")
@@ -1233,17 +1242,19 @@ def run_multi_background_optimization(args):
         False,  # 8 within_d0
         False,  # 9 within_pitch_angle
         True,  # 10 has_st
-        True,  # 11 no_opa
-        True,   # 12 no_crv_veto
-        True,   # 13 no_crv_quality
-        True,   # 14 no_crv_timewindow
-        True,   # 15 pz/pt
-        True,   # 16 triggers
-        False,  # 17 in_mom_range
-        False,  # 18 within_t0_early
-        False,  # 19 no_reflected
-        False,  # 20 within_t0
-        False   # 21 signal_region
+        True,  # 11 st_boundary (NEW)
+        True,  # 12 no_opa
+        True,   # 13 no_crv_veto
+        True,   # 14 no_crv_quality
+        True,   # 15 no_crv_timewindow
+        True,   # 16 pz/pt
+        True,   # 17 triggers
+        False,  # 18 in_mom_range
+        False,  # 19 within_t0_early
+        False,  # 20 no_reflected
+        False,  # 21 within_t0
+        False,   # 22 signal_region
+        False   # 23 mlp_score
     ]
     
     print("\n" + "=" * 80)
@@ -1422,7 +1433,205 @@ def run_multi_background_optimization(args):
     
     return rows
 
+def call_mlp(files, labels, cuts, locations, columns, signs):
+    """
+    Train MLP on d0 and rmax features for binary classification.
+    
+    Args:
+        files: list of filesets, e.g., [background_fileset, signal_fileset]
+               Each fileset is a list of file paths
+        labels: list of labels for each fileset, e.g., ["background", "signal"]
+        cuts: list of cut configurations for each file
+        locations: list of data locations for each file
+        columns: column names to use
+        signs: list of signs for each file
+    
+    Returns:
+        trainer: trained MLPTrainer instance with scores
+        scores_dict: dict with scores for each label, e.g., {"background": array, "signal": array}
+    """
+    from mlp import MLP, MLPTrainer, MLPDataset
+    import torch
+    from torch.utils.data import DataLoader
+    
+    logger = Logger(print_prefix="[call_mlp]", verbosity=1)
+    
+    # Track which file index we're on across all filesets
+    all_d0_by_label = {label: [] for label in labels}
+    all_rmax_by_label = {label: [] for label in labels}
+    all_costheta_by_label = {label: [] for label in labels}
+    file_idx = 0
+    
+    # Process each fileset
+    for fileset_idx, fileset in enumerate(files):
+        label = labels[fileset_idx]
+        logger.log(f"Processing fileset '{label}'", 1)
+        
+        for fil in fileset:
+            logger.log(f"Processing file: {fil}", 1)
+            ana_processor = AnaProcessor(fil, args.jobs, signs[file_idx], cuts[file_idx], locations[file_idx])
+            results = ana_processor.execute()
+            combine_result = results["combined_data"]
+            logger.log(f"  Loaded {len(combine_result)} events", 1)
 
+            # run cat
+            mc_count_array, _ = count_particle_types(combine_result, logger)
+
+            selector = Select()
+            
+            # select only track front to fit to
+            trk_front = selector.select_surface(combine_result['trkfit'], surface_name="TT_Front")
+
+            # did the track intersect the ST?
+            has_st  = selector.has_ST(combine_result['trkfit'])
+
+            # did the track intersect the OPA?
+            no_opa  = selector.has_OPA(combine_result['trkfit'])
+
+            # combined mask
+            trkfit_ent = ak.mask(combine_result['trkfit']["trksegs"], trk_front)
+                
+            trk_front_mc = selector.select_surface(combine_result['trkfit'], surface_name="TT_Front",branch_name="trksegsmc")
+            trkfit_ent_mc = ak.mask(combine_result['trkfit']["trksegsmc"], trk_front_mc)
+
+            # make vector mag branch
+            vector = Vector()
+            mom_mag = vector.get_mag(trkfit_ent ,'mom')
+
+            # plot cut distributions
+            test_mask = (trk_front)
+            all_d0_by_label[label].append(ak.mask(combine_result['trkfit']["trksegpars_lh"],test_mask)['d0'])
+            all_rmax_by_label[label].append(ak.mask(combine_result['trkfit']["trksegpars_lh"],test_mask)['maxr'])
+            
+            # Extract cosTheta from momentum vector
+            mom_vec = vector.get_vector(trkfit_ent, 'mom')  # Get momentum as vector
+            p_mag = vector.get_mag(trkfit_ent, 'mom')  # Get magnitude
+            pz = mom_vec.z  # Access z component
+            costheta = pz / p_mag
+            all_costheta_by_label[label].append(ak.mask(costheta, test_mask))
+            
+            # TODO: Compute dtdz_ratio = dtdz_slope / dtdz_exp
+            # velocity = 300 * mom / sqrt(mom^2 + 0.511^2)
+            # dtdz_exp = 1 / (velocity * cz)
+            # dtdz_ratio = dtdz_slope / dtdz_exp
+            # p_mag_masked = ak.mask(p_mag, test_mask)
+            # costheta_masked = ak.mask(costheta, test_mask)
+            # velocity = 300.0 * p_mag_masked / np.sqrt(p_mag_masked**2 + 0.511**2)
+            # dtdz_exp = 1.0 / (velocity * costheta_masked)
+            # trksegpars_masked = ak.mask(combine_result['trkfit']["trksegpars_lh"], test_mask)
+            # dtdz_slope = trksegpars_masked['dtdz']
+            # dtdz_ratio = dtdz_slope / dtdz_exp
+            # all_dtdz_ratio_by_label[label].append(dtdz_ratio)
+            
+            file_idx += 1
+    
+    # Combine across files within each fileset
+    combined_d0_by_label = {}
+    combined_rmax_by_label = {}
+    combined_costheta_by_label = {}
+    
+    for label in labels:
+        if all_d0_by_label[label]:
+            combined_d0_by_label[label] = ak.concatenate(all_d0_by_label[label])
+            combined_rmax_by_label[label] = ak.concatenate(all_rmax_by_label[label])
+            combined_costheta_by_label[label] = ak.concatenate(all_costheta_by_label[label])
+        else:
+            combined_d0_by_label[label] = ak.Array([])
+            combined_rmax_by_label[label] = ak.Array([])
+            combined_costheta_by_label[label] = ak.Array([])
+        
+        logger.log(f"{label}: {len(combined_d0_by_label[label])} events", 1)
+    
+    # Create combined dataset with labels for training
+    all_d0_combined = []
+    all_rmax_combined = []
+    all_costheta_combined = []
+    all_numeric_labels = []
+    
+    for label_idx, label in enumerate(labels):
+        d0_data = ak.to_numpy(ak.flatten(combined_d0_by_label[label], axis=None))
+        rmax_data = ak.to_numpy(ak.flatten(combined_rmax_by_label[label], axis=None))
+        costheta_data = ak.to_numpy(ak.flatten(combined_costheta_by_label[label], axis=None))
+        
+        all_d0_combined.append(d0_data)
+        all_rmax_combined.append(rmax_data)
+        all_costheta_combined.append(costheta_data)
+        all_numeric_labels.append(np.full(len(d0_data), label_idx))
+    
+    all_d0_combined = np.concatenate(all_d0_combined)
+    all_rmax_combined = np.concatenate(all_rmax_combined)
+    all_costheta_combined = np.concatenate(all_costheta_combined)
+    all_numeric_labels = np.concatenate(all_numeric_labels)
+    
+    logger.log(f"Total dataset: {len(all_numeric_labels)} events", 1)
+    logger.log(f"Creating dataset and dataloaders...", 1)
+    
+    # Create dataset and dataloaders
+    dataset = MLPDataset(all_d0_combined, all_rmax_combined, all_costheta_combined, all_numeric_labels)
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size]
+    )
+    
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+    
+    # Create and train model
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    logger.log(f"Using device: {device}", 1)
+    
+    model = MLP(input_dim=3, hidden_dim=64, dropout_rate=0.2)
+    trainer = MLPTrainer(model, device=device, learning_rate=1e-3)
+    
+    # Set normalization parameters from dataset
+    trainer.set_normalization(dataset)
+    
+    logger.log("Training MLP...", 1)
+    trainer.train(train_loader, val_loader, epochs=5, patience=10, verbose=True)
+    
+    # Get scores for each label
+    scores_dict = {}
+    features_dict = {"d0": {}, "rmax": {}, "costheta": {}}
+    
+    for label in labels:
+        scores = trainer.score(combined_d0_by_label[label], combined_rmax_by_label[label], combined_costheta_by_label[label])
+        scores_dict[label] = scores
+        logger.log(f"{label} scores: mean={np.mean(scores):.4f}, std={np.std(scores):.4f}", 1)
+        
+        # Store features for plotting
+        features_dict["d0"][label] = ak.to_numpy(ak.flatten(combined_d0_by_label[label], axis=None))
+        features_dict["rmax"][label] = ak.to_numpy(ak.flatten(combined_rmax_by_label[label], axis=None))
+        features_dict["costheta"][label] = ak.to_numpy(ak.flatten(combined_costheta_by_label[label], axis=None))
+    
+    # Plot score distributions
+    from mlp import plot_mlp_scores, plot_mlp_features, optimize_mlp_cut, plot_mlp_optimization, plot_mlp_tmva_style
+    plot_mlp_scores(scores_dict, labels, output_path="mlp_scores.png")
+    plot_mlp_features(features_dict, labels, output_path="mlp_features.png")
+    
+    # Optimize MLP cut for S/sqrt(S+B)
+    logger.log("Optimizing MLP cut...", 1)
+    optimal_result = optimize_mlp_cut(scores_dict, signal_label="signal", background_label="background")
+    
+    logger.log("=" * 80, 1)
+    logger.log("MLP CUT OPTIMIZATION RESULTS", 1)
+    logger.log("=" * 80, 1)
+    logger.log(f"Optimal threshold: {optimal_result['threshold']:.6f}", 1)
+    logger.log(f"S/√(S+B): {optimal_result['s_over_sqrt_sb']:.6f}", 1)
+    logger.log(f"Signal efficiency: {optimal_result['signal_efficiency']:.4f}", 1)
+    logger.log(f"  ({optimal_result['signal_count']} / {optimal_result['total_signal']} signal events)", 1)
+    logger.log(f"Background rejection: {optimal_result['background_rejection']:.4f}", 1)
+    logger.log(f"  ({optimal_result['total_background'] - optimal_result['background_count']} / {optimal_result['total_background']} background events rejected)", 1)
+    logger.log("=" * 80, 1)
+    
+    # Plot optimization results
+    plot_mlp_optimization(scores_dict, optimal_result, output_path="mlp_optimization.png")
+    
+    # Plot TMVA-style curve
+    plot_mlp_tmva_style(scores_dict, optimal_result, output_path="mlp_tmva.png")
+    
+    return trainer, scores_dict, optimal_result 
+      
 # Create an instance of our custom processor
 def  main(args):
   """ main driver function to run analysis
@@ -1452,9 +1661,73 @@ def  main(args):
       False, #19 no_reflected
       True,  #20 within_t0
       True, # 21 signal region cut
-      True # or trigger select
+      True, # or trigger select
+      True #MLP score
   ]
   if args.sign == "minus":
+    new= [
+      True,  # 0 has_a_track (event has >=1 track)
+      True,  # 1 is_good_track
+      True,  # 2 has_trk_front_seg
+      True,  # 3 is_reco_electron_or_positron (generic e/e+)
+      True,  # 4 has_downstream
+      True,  # 5 charge_selection (PDG = 11, electrons)
+      True,  # 6 or_trigger
+      True,  # 7 no_upstream
+      False, # 8 alt_hypothesis_upstream_veto
+      True,  # 9 no_multi_trk_veto
+      True,  #10 good_trkpid
+      True,  #11 pz_over_pt
+      True,  #12 has_st
+      True,  #13 no_opa
+      True,  #14 good_trkqual
+      True,  #15 has_hits
+      True,  #16 within_t0err
+      True,  #17 no_crv_veto
+      True,  #18 in_mom_range
+      True,  #19 within_t0_475 (475-1650 ns)
+      True, #20 within_t0_540 (540-1650 ns)
+      True, #21 within_t0_640 (640-1650 ns)
+      True   #22 signal_region
+    ]
+  if args.sign == "plus":
+    new= [
+      True,  # 0 has_a_track (event has >=1 track)
+      True,  # 1 is_good_track
+      True,  # 2 has_trk_front_seg
+      True,  # 3 is_reco_electron_or_positron (generic e/e+)
+      True,  # 4 has_downstream
+      True,  # 5 charge_selection (PDG = -11, positrons)
+      True,  # 6 or_trigger
+      True,  # 7 no_upstream
+      False, # 8 alt_hypothesis_upstream_veto
+      True,  # 9 no_multi_trk_veto
+      True,  #10 good_trkpid
+      True,  #11 pz_over_pt
+      True,  #12 has_st
+      True,  #13 no_opa
+      False, #14 good_trkqual (disabled for e+)
+      True,  #15 has_hits
+      True,  #16 within_t0err
+      True,  #17 no_crv_veto
+      True,  #18 in_mom_range
+      False, #19 within_t0_475 (475-1650 ns) (disabled for e+)
+      True,  #20 within_t0_540 (540-1650 ns)
+      False, #21 within_t0_640 (640-1650 ns)
+      False  #22 signal_region (disabled for e+)
+    ]
+
+  if args.proctype == "train":
+    
+    files = [
+        ["file_lists/Cosmics_MDC2025an_nomix.txt"],  # Background fileset
+        ["file_lists/signal.txt"]       # Signal fileset
+    ]
+    labels = ["background", "signal"]
+    signs = [args.sign, args.sign]
+    locations = [args.loc, args.loc]
+    columns = []
+    
     new= [
       True,  # 0 is_reco_electron
       True,  # 1 has_downstream
@@ -1466,48 +1739,44 @@ def  main(args):
       False, # 7 within_lhr_maxl
       False, # 8 within_d0
       False, # 9 within_pitch_angle
-      True,  #10 has_st
-      True,  #11 no_opa
-      True,  #12 no_crv_veto
+      False,  #10 has_st
+      False,  #11 no_opa
+      False,  #12 no_crv_veto
       False,  #13 no_crv_quality
-      True,  #14 no_crv_timewindow
-      True,  #15 pz/pt
+      False,  #14 no_crv_timewindow
+      False,  #15 pz/pt
       False,  #16 all triggers - DEPRECATED!!!!!
-      True,  #17 in_mom_range
+      False,  #17 in_mom_range
       False, #18 within_t0_early
-      True, #19 no_reflected
-      True,  #20 within_t0
-      False, # 21 signal region cut
-      True  # or trigger select
-    ]
-  if args.sign == "plus":
-    new= [
-      True,  # 0 is_reco_electron
-      True,  # 1 has_downstream
-      True, # 2 has trk front
-      True,  # 3 good_trkqpid
-      False,  # 4 good_trkqual
-      True,  # 5 within_t0err
-      True,  # 6 has_hits
-      False, # 7 within_lhr_maxl
-      False, # 8 within_d0
-      False, # 9 within_pitch_angle
-      True,  #10 has_st
-      True,  #11 no_opa
-      True,  #12 no_crv_veto
-      False,  #13 no_crv_quality
-      True,  #14 no_crv_timewindow
-      True,  #15 pz/pt
-      False,  #16 all triggers - DEPRECATED!!!!!
-      True,  #17 in_mom_range
-      True, #18 within_t0_early
       True, #19 no_reflected
       False,  #20 within_t0
       False, # 21 signal region cut
-      True  # or trigger select
+      False   # 22 mlp_score
     ]
+    cuts = [new,new]
+
+    trainer, scores_dict, optimal_result = call_mlp(files, labels, cuts, locations, columns, signs)
+
+    import torch
+    torch.save(trainer.model.state_dict(), "mlp_model.pth")
+    
+    # Save normalization parameters
+    import json
+    norm_params = {
+        "d0_mean": float(trainer.d0_mean),
+        "d0_std": float(trainer.d0_std),
+        "rmax_mean": float(trainer.rmax_mean),
+        "rmax_std": float(trainer.rmax_std),
+        "costheta_mean": float(trainer.costheta_mean),
+        "costheta_std": float(trainer.costheta_std),
+    }
+    with open("mlp_normalization.json", "w") as f:
+        json.dump(norm_params, f, indent=2)
+    print("Model saved to mlp_model.pth")
+    print("Normalization params saved to mlp_normalization.json")
 
   print("starting main function with cuts:", new)
+
   if args.proctype == "optimize_cuts":
     run_multi_background_optimization(args)
     return
@@ -1553,6 +1822,9 @@ def  main(args):
       rle_calib_dir="RLE/common"
     )
   """
+  
+  
+  
   print("Done plotting")
   return
   
@@ -1575,9 +1847,9 @@ if __name__ == "__main__":
     parser.add_argument("--file", type=str, required=True, help="filename or file list name (text file list,fullpaths)")
     parser.add_argument("--loc", type=str, required=False, default='disk', help="location of files")
     parser.add_argument("--sign", type=str, required=False, default='minus', help="sign of the signal being sought in words (default: minus)")
-    parser.add_argument("--proctype", type=str, required=False, default='ensemble', help="process type: 'ensemble', 'cosmics', 'rpc', 'rle', 'convolution', 'overlay' (default: ensemble)")
+    parser.add_argument("--proctype", type=str, required=False, default='ensemble', help="process type: 'ensemble', 'cosmics', 'rpc', 'rle', 'convolution', 'overlay', 'train' (default: ensemble)")
     parser.add_argument("--jobs", type=int, required=False, default=1,help="use if more than one file, should be nfiles")
-    parser.add_argument("--verbose", type=int, default=1, help="verbose")
+    parser.add_argument("--verbose", type=int, default=0, help="verbose")
     
     print("DEBUG: Parsing arguments", flush=True)
     args = parser.parse_args()
@@ -1591,7 +1863,3 @@ if __name__ == "__main__":
     # run main function
     main(args)
     print("DEBUG: Script completed", flush=True)
-
-
-
-
