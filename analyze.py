@@ -46,7 +46,7 @@ class Analyze:
             from mlp import MLP, MLPTrainer
             import json
             
-            self.logger.log("Starting MLP model load", "debug")
+            self.logger.log("Starting MLP model load", "info")
             
             model_path = 'mlp_model.pth'
             norm_path = 'mlp_normalization.json'
@@ -56,7 +56,7 @@ class Analyze:
                 self.logger.log(f"MLP model not found at {model_path}, skipping", "warning")
                 return
             
-            self.logger.log(f"Loading model from {model_path}", "debug")
+            self.logger.log(f"Loading model from {model_path}", "info")
             
             # Load model architecture and weights
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -67,7 +67,7 @@ class Analyze:
             
             # Create trainer wrapper (needed for score() method)
             self.mlp_trainer = MLPTrainer(self.mlp_model, device=device)
-            self.logger.log(f"MLP trainer created", "debug")
+            self.logger.log(f"MLP trainer created", "info")
             
             # Load normalization parameters
             if os.path.exists(norm_path):
@@ -314,128 +314,209 @@ class Analyze:
             )
 
             # ============================================================================
-            # CUT 7: no_upstream
+            # CUT 7: upstream_veto (timing-based)
             # ============================================================================
-            # Veto tracks that have upstream segment (pz < 0 in tracker)
-            cut_manager.add_cut(
-                name="no_upstream",
-                description="All tracks are downstream (no p_z < 0 in tracker)",
-                mask=~is_upstream,
-                active=self.switch[7]
-            )
-
-            # ============================================================================
-            # CUT 8: upstream_veto (timing-based)
-            # ============================================================================
-            # For each track, check timing to ALL upstream partner tracks
-            # Matches C++: upstream_veto &= dt < 40 || dt > 110
-            # PASS if NO upstream partner has dt in [40, 110] ns
             try:
-                trk_t_front = data['trkfit']["trksegs"]["time"][at_trk_front]
-                trk_t_front_mean = ak.mean(trk_t_front, axis=-1, keepdims=False)  # (events, tracks)
-                
-                # Identify upstream tracks (pz < 0 at TT_Front)
-                is_upstream_track = ~is_downstream  # (events, tracks)
-                
-                # Pairwise time differences: (events, tracks_i, tracks_j)
-                dt_matrix = trk_t_front_mean[:, :, None] - trk_t_front_mean[:, None, :]
-                
-                # Check which (track_i, track_j) pairs have dt in [40, 110] ns
-                dt_in_window = (ak.abs(dt_matrix) >= 40.0) & (ak.abs(dt_matrix) <= 110.0)
-                
-                # Mask only upstream tracks as partners
-                dt_in_window_upstream = ak.where(
-                    is_upstream_track[:, None, :],  # only check against upstream tracks
-                    dt_in_window,
-                    False
+                # 1. Compute IsGood() condition matching C++:
+                # bool IsGood(): track != null && status >= 0 && goodfit != 0
+                trk_status = data['trk']["trk.status"]
+                trk_goodfit = data['trk']["trk.goodfit"]
+
+                is_good = (
+                    ~ak.is_none(trk_status)
+                    & ~ak.is_none(trk_goodfit)
+                    & (trk_status >= 0)
+                    & (trk_goodfit != 0)
                 )
+                is_good_clean = ak.fill_none(is_good, False)
+                n_good = int(ak.sum(is_good_clean))
+
+                # 2. Extract track times - use trk.t0 (fitted track time) to match C++
+                # Fallback to first segment time at TT_Front if trk.t0 unavailable
+                try:
+                    track_times = data["trk"]["trk.t0"]
+                    if track_times is None:
+                        raise ValueError("trk.t0 unavailable")
+                    self.logger.log(f"[upstream_veto] Using trk.t0 for track times", "debug")
+                except Exception as e:
+                    self.logger.log(f"trk.t0 access failed ({e}), using segment times fallback", "warning")
+                    trk_t_front = data['trkfit']["trksegs"]["time"][at_trk_front]
+                    track_times = ak.fill_none(ak.firsts(trk_t_front, axis=-1), 0.0)
+                    self.logger.log(f"[upstream_veto] Using fallback segment times", "debug")
+
+                # 3. Sanitize masks and handle missing OptionTypes/Nones
+                trk_t_front_mean_clean = ak.fill_none(track_times, np.nan)
+                has_valid_time = ak.fill_none(~np.isnan(trk_t_front_mean_clean), False)
+                n_valid_time = int(ak.sum(has_valid_time))
                 
-                # For each track, check if ANY upstream partner has dt in [40, 110] (this would veto)
-                has_bad_upstream_match = ak.any(dt_in_window_upstream, axis=2)
+                is_downstream_clean = ak.fill_none(is_downstream, False)
+                n_ds = int(ak.sum(is_downstream_clean))
+
+                # 4. Define Target (downstream) and Partner (upstream) track masks
+                # Target: downstream signal track (PZFront > 0, IsGood(), Valid Time)
+                is_target_track = is_downstream_clean & is_good_clean & has_valid_time
                 
-                # Pass if NO upstream partner has dt in [40, 110] (matches C++: upstream_veto &= dt < 40 || dt > 110)
-                upstream_veto_pass = ~has_bad_upstream_match
+                # Partner: candidate upstream reflection track (PZFront < 0, IsGood(), Valid Time)
+                is_partner_track = (~is_downstream_clean) & is_good_clean & has_valid_time
+
+                # 5. Build FULL pairwise matrix (events, all_tracks, all_tracks)
+                # for all possible track pairs
+                trk_times_i = trk_t_front_mean_clean[:, :, None]  # (events, all_tracks, 1)
+                trk_times_j = trk_t_front_mean_clean[:, None, :]  # (events, 1, all_tracks)
+                dt_matrix = trk_times_i - trk_times_j  # (events, all_tracks, all_tracks)
                 
-                cut_manager.add_cut(
-                    name="upstream_veto",
-                    description="Upstream timing veto: dt to upstream partners must be < 40 or > 110 ns",
-                    mask=upstream_veto_pass,
-                    active=self.switch[8]
-                )
+                # Broadcast track property flags
+                is_downstream_i = is_downstream_clean[:, :, None]  # (events, all_tracks, 1)
+                is_upstream_j = (~is_downstream_clean)[:, None, :]  # (events, 1, all_tracks)
+                is_good_i = is_good_clean[:, :, None]  # (events, all_tracks, 1)
+                is_good_j = is_good_clean[:, None, :]  # (events, 1, all_tracks)
                 
-            except Exception as e:
-                self.logger.log(f"Error in upstream_veto: {e}", "warning")
-                cut_manager.add_cut(
-                    name="upstream_veto",
-                    description="Upstream timing veto: dt to upstream partners must be < 40 or > 110 ns",
-                    mask=ak.ones_like(is_downstream, dtype=bool),
-                    active=self.switch[8]
+                # Exclude self-pairing
+                track_idx_i = ak.local_index(is_downstream_clean, axis=1)[:, :, None]
+                track_idx_j = ak.local_index(is_downstream_clean, axis=1)[:, None, :]
+                is_self = track_idx_i == track_idx_j
+
+                # 6. Check C++ veto window: 40 <= dt <= 110 ns
+                # Negation of (dt < 40.f || dt > 110.f) -> flags bad candidate reflection pairs
+                dt_in_veto_window = (dt_matrix >= 40.0) & (dt_matrix <= 110.0)
+
+                # 7. Flag bad pairs: track_i is downstream (good), track_j is upstream (good), not self, dt in window
+                bad_pair_matrix = (
+                    dt_in_veto_window
+                    & is_downstream_i & is_good_i  # track_i must be downstream & good
+                    & is_upstream_j & is_good_j    # track_j must be upstream & good
+                    & ~is_self                      # exclude self-pairing
                 )
 
+                # 8. For each track i, check if it has ANY bad upstream partner
+                # Reduce axis=2 (all j partners) to get per-track result (events, all_tracks)
+                has_bad_partner = ak.any(bad_pair_matrix, axis=2)  # (events, all_tracks)
+                upstream_veto_per_track = ~has_bad_partner  # True = pass, False = fail
+                upstream_veto_per_track = ak.fill_none(upstream_veto_per_track, True)
+
+                # 8. PER-TRACK REDUCTION (Collapse axis 2 only to get per-track boolean)
+                # Matches C++: For each target track, upstream_veto &= condition for ALL partners
+                # Output: (events, tracks) per-track mask, True if track passes veto
+                try:
+                    n_pass = int(ak.sum(upstream_veto_per_track))
+                    n_total = int(ak.count(upstream_veto_per_track))
+                    n_fail_downstream = int(ak.sum(~upstream_veto_per_track & is_downstream_clean))
+                    n_pass_downstream = int(ak.sum(upstream_veto_per_track & is_downstream_clean))
+                except Exception as e2:
+                    print(f"[ERROR] During summary: {type(e2).__name__}: {e2}")
+                    print(f"[ERROR] Traceback: {traceback.format_exc()}")
+                    raise
+
+                # Register the cut mask
+                cut_manager.add_cut(
+                    name="upstream_veto",
+                    description="Upstream timing veto: dt to upstream partners must be < 40 or > 110 ns",
+                    mask=upstream_veto_per_track,
+                    active=self.switch[7]
+                )
+
+            except Exception as e:
+                print(f"[ERROR] upstream_veto EXCEPTION: {type(e).__name__}: {e}")
+                print(f"[ERROR] Full traceback:\n{traceback.format_exc()}")
+                self.logger.log(f"ERROR in upstream_veto: {type(e).__name__}: {e}", "error")
+                self.logger.log(f"Full traceback:\n{traceback.format_exc()}", "error")
+
+                # FALLBACK: All tracks pass (no veto applied)
+                fallback_mask = ak.ones_like(ak.num(is_downstream, axis=1) > 0, dtype=bool)
+                print(f"[ERROR] upstream_veto: Using FALLBACK (all tracks pass) - CHECK ERRORS ABOVE")
+                self.logger.log(f"upstream_veto: Using FALLBACK (all tracks pass) - CHECK ERRORS ABOVE", "warning")
+                cut_manager.add_cut(
+                    name="upstream_veto",
+                    description="Upstream timing veto: dt to upstream partners must be < 40 or > 110 ns",
+                    mask=fallback_mask,
+                    active=self.switch[7]
+                )
             # ============================================================================
-            # CUT 9: no_multi_trk_veto
+            # CUT 8: no_multi_trk_veto
             # ============================================================================
             if (str(self.sign) == "minus"):
                 try:
                     dt_threshold = 150.0
                     
-                    # Get downstream electron/positron tracks
+                    # DIAGNOSTICS: Step-by-step breakdown
                     is_reco_electron = selector.is_electron(data["trk"])
                     is_reco_positron = selector.is_positron(data["trk"])
-                    is_downstream_epm = is_downstream & (is_reco_electron | is_reco_positron)
                     
-                    # Get track times using TFront property (safer than extracting segments)
-                    # This uses the fitted track time at the tracker front
-                    try:
-                        track_times = data["trk"]["trk.t0"]
-                        if track_times is None:
-                            raise ValueError("Track times unavailable")
-                    except:
-                        # Fallback: extract from trkfit segments
-                        trk_times = data['trkfit']["trksegs"]["time"][at_trk_front]
-                        track_times = ak.fill_none(ak.firsts(trk_times, axis=-1), 0.0)
+                    # Get downstream electron/positron tracks (must also be IsGood like C++)
+                    # IsGood(): status >= 0 && goodfit != 0
+                    trk_status = data['trk']["trk.status"]
+                    trk_goodfit = data['trk']["trk.goodfit"]
+                    is_good = (
+                        ~ak.is_none(trk_status)
+                        & ~ak.is_none(trk_goodfit)
+                        & (trk_status >= 0)
+                        & (trk_goodfit != 0)
+                    )
+                    is_good_clean = ak.fill_none(is_good, False)
                     
-                    # Broadcast for pairwise comparison: (events, tracks, tracks)
-                    track_times_i = track_times[:, :, None]
-                    track_times_j = track_times[:, None, :]
+                    is_downstream_epm = is_downstream & (is_reco_electron | is_reco_positron) & is_good_clean
                     
-                    # Pairwise time differences
-                    dt_matrix = ak.abs(track_times_i - track_times_j)
-                    
-                    # Broadcast particle type flags: both track i and track j must be downstream e/e+
-                    is_good_i = is_downstream_epm[:, :, None]  # (events, tracks, 1)
-                    is_good_j = is_downstream_epm[:, None, :]  # (events, 1, tracks)
-                    
-                    # Check for coincident tracks: 
-                    # - Both track i and j are downstream e/e+
-                    # - Within 150 ns
-                    is_coincident = (dt_matrix < dt_threshold) & is_good_i & is_good_j
-                    
-                    # Count coincident tracks per track (including self)
-                    n_coincident_per_track = ak.sum(is_coincident, axis=-1)
-                    
-                    # Subtract self-contribution (diagonal where i==j, only if track is e/e+)
-                    self_count = ak.where(is_downstream_epm, 1, 0)
-                    has_other_coincident = n_coincident_per_track - self_count > 0
-                    
-                    # Per-track: PASS if this track has NO other coincident partners (matches C++: multi_trk &= std::fabs(dt) > 150)
-                    multi_trk_per_track = ~has_other_coincident
+                    # If no e/e+ tracks found, veto passes all (no coincident pairs possible)
+                    n_total_epm = int(ak.sum(is_downstream_epm))
+                    if n_total_epm == 0:
+                        multi_trk_per_track = ak.ones_like(is_downstream, dtype=bool)
+                    else:
+                        # Get track times using TFront property (safer than extracting segments)
+                        # This uses the fitted track time at the tracker front
+                        try:
+                            track_times = data["trk"]["trk.t0"]
+                            if track_times is None:
+                                raise ValueError("Track times unavailable")
+                            print(f"[no_multi_trk_veto DIAG-3] Using trk.t0 for track times")
+                        except Exception as time_err:
+                            # Fallback: extract from trkfit segments - use MEAN like upstream_veto does
+                            trk_times = data['trkfit']["trksegs"]["time"][at_trk_front]
+                            track_times = ak.mean(trk_times, axis=-1, keepdims=False)
+                            track_times = ak.fill_none(track_times, 0.0)
+                        
+                        # Broadcast for pairwise comparison: (events, tracks, tracks)
+                        track_times_i = track_times[:, :, None]
+                        track_times_j = track_times[:, None, :]
+                        
+                        # Pairwise time differences (use np.abs, not ak.abs)
+                        dt_matrix = np.abs(track_times_i - track_times_j)
+                        
+                        # Broadcast particle type flags: both track i and track j must be downstream e/e+
+                        is_good_i = is_downstream_epm[:, :, None]  # (events, tracks, 1)
+                        is_good_j = is_downstream_epm[:, None, :]  # (events, 1, tracks)
+                        
+                        # Check for coincident tracks: 
+                        # - Both track i and j are downstream e/e+
+                        # - Within 150 ns
+                        is_coincident = (dt_matrix < dt_threshold) & is_good_i & is_good_j
+                        
+                        # Count coincident tracks per track (including self)
+                        n_coincident_per_track = ak.sum(is_coincident, axis=-1)
+                        
+                        # Subtract self-contribution (diagonal where i==j, only if track is e/e+)
+                        self_count = ak.where(is_downstream_epm, 1, 0)
+                        has_other_coincident = n_coincident_per_track - self_count > 0
+                        
+                        # Per-track: PASS if this track has NO other coincident partners (matches C++: multi_trk &= std::fabs(dt) > 150)
+                        multi_trk_per_track = ~has_other_coincident
                     
                     cut_manager.add_cut(
                         name="no_multi_trk_veto",
                         description="No coincident multi-track: |dt| >= 150 ns between downstream e/e+ tracks",
                         mask=multi_trk_per_track,
-                        active=self.switch[9]
+                        active=self.switch[8]
                     )
                     data["no_multi_trk_veto"] = multi_trk_per_track
                 except Exception as e:
                     self.logger.log(f"Error in multi-track timing veto: {e}", "warning")
+                    import traceback
+                    self.logger.log(traceback.format_exc(), "warning")
                     # On error, pass the cut (don't veto)
                     cut_manager.add_cut(
                         name="no_multi_trk_veto",
                         description="No coincident multi-track: |dt| >= 150 ns between downstream e/e+ tracks",
                         mask=ak.ones_like(is_downstream, dtype=bool),
-                        active=self.switch[9]
+                        active=self.switch[8]
                     )
             else:
                 # For plus sign, no multi-track veto
@@ -470,37 +551,47 @@ class Analyze:
                 name="good_trkpid",
                 description="Track PID > 0.55 and event has calorimeter cluster energy > 0",
                 mask=good_trkpid,
-                active=self.switch[10]
+                active=self.switch[9]
             )
 
             # ============================================================================
             # CUT 10: pz_over_pt
             # ============================================================================
+            # Use tanDip from segment parameters at TT_Front (matches C++ TanDipFront())
             try:
+                # Get tanDip directly from segment parameters at TT_Front
+                tandip_at_front = data['trkfit']["trksegpars_lh"]["tanDip"][at_trk_front]
+                # For each track, use the tanDip value at TT_Front (should be single value per track)
+                # Extract the first (or only) value at TT_Front for each track
+                tandip_values = ak.firsts(tandip_at_front, axis=-1)
+                # Fill any missing with -100 sentinel
+                tandip_values = ak.fill_none(tandip_values, -100.0)
+            except Exception:
+                # Fallback: compute from momentum if segment params unavailable
                 vec = Vector(verbosity=0)
                 trkfit_ent_pzpt = ak.mask(data['trkfit']["trksegs"], at_trk_front)
                 vec3 = vec.get_vector(trkfit_ent_pzpt, 'mom')
                 if vec3 is None:
-                    raise Exception("failed to create momentum vector")
+                    tandip_values = ak.full_like(data['trk']["trk.status"], -100.0, dtype=float)
+                else:
+                    px = vec3.x
+                    py = vec3.y
+                    pz = vec3.z
+                    pt = vec3.rho
+                    # Compute tanDip = pz / pt
+                    tandip_values = ak.where((pt > 0) & (pz != 0), pz / pt, -100.0)
+                    # Get per-track value (use first segment at TT_Front)
+                    tandip_values = ak.firsts(tandip_values, axis=-1)
+                    tandip_values = ak.fill_none(tandip_values, -100.0)
 
-                px = vec3.x
-                py = vec3.y
-                pz = vec3.z
-                pt = vec3.rho
-
-                pz_over_pt = ak.where((pt > 0) & (pz != 0), pz / pt, ak.full_like(pt, -100.0))
-            except Exception:
-                pz_over_pt = ak.full_like(data['trkfit']["trksegs"]["time"], -100.0)
-
-            mask_seg = (pz_over_pt > 0.575) & (pz_over_pt < 0.85)
-            mask_pzpt = ak.all(~at_trk_front | mask_seg, axis=-1)
-            data["pz_over_pt"] = pz_over_pt
+            # Apply cut: 0.575 < tanDip < 0.85
+            mask_pzpt = (tandip_values > 0.575) & (tandip_values < 0.85)
 
             cut_manager.add_cut(
                 name="pz_over_pt",
-                description="Track-level cut: 0.575 < pz/pt < 0.85",
+                description="Track-level cut: 0.575 < tanDip < 0.85",
                 mask=mask_pzpt,
-                active=self.switch[9]
+                active=self.switch[10]
             )
 
             # ============================================================================
@@ -546,7 +637,7 @@ class Analyze:
                 name="has_st",
                 description="has Nst > 0",
                 mask=has_st,
-                active=self.switch[10]
+                active=self.switch[12]
             )
 
             # ============================================================================
@@ -557,7 +648,7 @@ class Analyze:
                 name="no_opa",
                 description="has N_opa == 0",
                 mask=no_OPA,
-                active=self.switch[13]
+                active=self.switch[12]
             )
 
             # ============================================================================
@@ -569,7 +660,7 @@ class Analyze:
                 name="good_trkqual",
                 description="Track quality > 0.155",
                 mask=good_trkqual,
-                active=self.switch[14]
+                active=self.switch[13]
             )
 
             # ============================================================================
@@ -580,7 +671,7 @@ class Analyze:
                 name="has_hits",
                 description="Minimum of 20 active hits in the tracker",
                 mask=has_hits,
-                active=self.switch[15]
+                active=self.switch[14]
             )
 
             # ============================================================================
@@ -592,7 +683,7 @@ class Analyze:
                 name="within_t0err",
                 description="t0err < 0.85",
                 mask=within_t0err,
-                active=self.switch[16]
+                active=self.switch[15]
             )
 
             # ============================================================================
@@ -632,7 +723,7 @@ class Analyze:
                 name="in_mom_range",
                 description="100 < mom < 110 MeV/c",
                 mask=in_mom_range,
-                active=self.switch[18]
+                active=self.switch[17]
             )
 
             # ============================================================================
@@ -645,7 +736,7 @@ class Analyze:
                 name="within_t0_475",
                 description="475 < t_0 < 1650 ns",
                 mask=within_t0_475,
-                active=self.switch[19]
+                active=self.switch[18]
             )
 
             # ============================================================================
@@ -658,7 +749,7 @@ class Analyze:
                 name="within_t0_540",
                 description="540 < t_0 < 1650 ns",
                 mask=within_t0_540,
-                active=self.switch[20]
+                active=self.switch[19]
             )
 
             # ============================================================================
@@ -671,25 +762,42 @@ class Analyze:
                 name="within_t0_640",
                 description="640 < t_0 < 1650 ns",
                 mask=within_t0_640,
-                active=self.switch[21]
+                active=self.switch[20]
             )
 
             # ============================================================================
             # CUT 21: signal_region
             # ============================================================================
-            signal_mom_mask = ((103.34 < mom_mag) & (mom_mag < 104.74))
-            signal_mom_mask = ak.all(~at_trk_front | signal_mom_mask, axis=-1)
-   
-            signal_time_mask = ((640 < data['trkfit']["trksegs"]["time"]) & 
-                                (data['trkfit']["trksegs"]["time"] < 1650))
-            signal_time_mask = ak.all(~at_trk_front | signal_time_mask, axis=-1)
+            # Matches C++ RunACutFlow: PFront() > 103.34 && PFront() < 104.74 && TFront() > 640 && TFront() < 1650
             
-            signal_region = signal_mom_mask & signal_time_mask
+            # Get momentum magnitude at TT_Front (matches C++ PFront())
+            mom_at_front = data['trkfit']["trksegs"]["mom"][at_trk_front]
+            mom_mag_at_front = np.sqrt(
+                mom_at_front["fCoordinates"]["fX"]**2 + 
+                mom_at_front["fCoordinates"]["fY"]**2 + 
+                mom_at_front["fCoordinates"]["fZ"]**2
+            )
+            # Extract per-track value (earliest segment at front)
+            mom_front_per_track = ak.firsts(mom_mag_at_front, axis=-1)
+            mom_front_per_track = ak.fill_none(mom_front_per_track, -100.0)
+            
+            # Get time at TT_Front (matches C++ TFront())
+            time_at_front = data['trkfit']["trksegs"]["time"][at_trk_front]
+            # Extract per-track value (earliest segment at front)
+            time_front_per_track = ak.firsts(time_at_front, axis=-1)
+            time_front_per_track = ak.fill_none(time_front_per_track, -100.0)
+            
+            # Apply signal region cuts: momentum and time at front
+            signal_region = (
+                (mom_front_per_track > 103.34) & (mom_front_per_track < 104.74) &
+                (time_front_per_track > 640.0) & (time_front_per_track < 1650.0)
+            )
+            
             cut_manager.add_cut(
                 name="signal_region",
-                description="Signal region: 103.34 < mom < 104.74, 640 < t < 1650 ns",
+                description="Signal region: 103.34 < P_Front < 104.74, 640 < T_Front < 1650 ns",
                 mask=signal_region,
-                active=self.switch[22]
+                active=self.switch[21]
             )
             data["signal_region"] = signal_region
 
@@ -878,7 +986,7 @@ class Analyze:
             # Log mask statistics
             n_mask_true = int(ak.sum(ak.flatten(mlp_mask, axis=None)))
             n_mask_total = int(ak.sum(ak.num(mlp_mask, axis=1)))
-            self.logger.log(f"MLP mask: {n_mask_true}/{n_mask_total} tracks pass threshold", "debug")
+            self.logger.log(f"MLP mask: {n_mask_true}/{n_mask_total} tracks pass threshold", "info")
             
             # Apply mask to data
             data_filtered = ak.copy(data)
@@ -919,15 +1027,15 @@ class Analyze:
         """Plot MLP score distribution."""
         try:
             if not hasattr(self, 'mlp_scores') or self.mlp_scores is None:
-                self.logger.log("MLP scores not available for plotting", "debug")
+                self.logger.log("MLP scores not available for plotting", "info")
                 return
             
-            self.logger.log(f"Attempting to plot {len(self.mlp_scores)} total MLP scores", "debug")
+            self.logger.log(f"Attempting to plot {len(self.mlp_scores)} total MLP scores", "info")
             
             # Filter out invalid scores (-999.0)
             valid_scores = self.mlp_scores[self.mlp_scores > -900]
             
-            self.logger.log(f"Found {len(valid_scores)} valid MLP scores", "debug")
+            self.logger.log(f"Found {len(valid_scores)} valid MLP scores", "info")
             
             if len(valid_scores) == 0:
                 self.logger.log("No valid MLP scores to plot", "warning")
@@ -1010,7 +1118,7 @@ class Analyze:
                     pass
             else:
                 data_CE_mlp = data_CE
-                self.logger.log("MLP filter disabled (apply_mlp=False)", "debug")
+                self.logger.log("MLP filter disabled (apply_mlp=False)", "info")
             
             # Plot MLP scores if available (disabled by default)
             # self.plot_mlp_scores(data, data_CE, file_id)

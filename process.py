@@ -1096,22 +1096,21 @@ def run_cut_optimization(file_list_path, sign="minus", cuts=None, locations='dis
                 True,  # 4: has_downstream
                 True,  # 5: charge_selection
                 True,  # 6: or_trigger
-                True,  # 7: no_upstream
-                True,  # 8: upstream_veto (timing-based)
-                True,  # 9: no_multi_trk_veto
-                True,  # 10: good_trkpid
-                True,  # 11: pz_over_pt
-                True,  # 12: st_boundary
-                True,  # 13: has_st
-                True,  # 14: no_opa
-                True,  # 15: good_trkqual
-                True,  # 16: has_hits
-                True,  # 17: within_t0err
-                True,  # 18: no_crv_veto
-                True,  # 19: in_mom_range
-                True,  # 20: within_t0_475
-                True,  # 21: within_t0_540
-                True   # 22: within_t0_640
+                True,  # 7: upstream_veto (timing-based)
+                True,  # 8: no_multi_trk_veto
+                True,  # 9: good_trkpid
+                True,  # 10: pz_over_pt
+                True,  # 11: st_boundary
+                True,  # 12: has_st
+                True,  # 13: no_opa
+                True,  # 14: good_trkqual
+                True,  # 15: has_hits
+                True,  # 16: within_t0err
+                True,  # 17: no_crv_veto
+                True,  # 18: in_mom_range
+                True,  # 19: within_t0_475
+                True,  # 20: within_t0_540
+                True   # 21: within_t0_640
             ]
         
     
@@ -1673,8 +1672,7 @@ def  main(args):
       True,  # 4 has_downstream
       True,  # 5 charge_selection (PDG = 11, electrons)
       True,  # 6 or_trigger
-      True,  # 7 no_upstream
-      False, # 8 alt_hypothesis_upstream_veto
+      True, # 8 upstream_veto
       True,  # 9 no_multi_trk_veto
       True,  #10 good_trkpid
       True,  #11 pz_over_pt
